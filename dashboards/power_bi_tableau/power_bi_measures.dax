@@ -1,0 +1,29 @@
+Baseline Profit =
+CALCULATE(
+    MAX(fact_scenario_comparison[profit_gbp]),
+    fact_scenario_comparison[scenario] = "baseline_current_price"
+)
+
+Unconstrained Profit =
+CALCULATE(
+    MAX(fact_scenario_comparison[profit_gbp]),
+    fact_scenario_comparison[scenario] = "unconstrained_price_optimizer"
+)
+
+Constrained Profit =
+CALCULATE(
+    MAX(fact_scenario_comparison[profit_gbp]),
+    fact_scenario_comparison[scenario] = "constrained_execution_plan"
+)
+
+Approved Price Changes =
+CALCULATE(
+    MAX(fact_scenario_comparison[selected_price_changes]),
+    fact_scenario_comparison[scenario] = "constrained_execution_plan"
+)
+
+Review Rows =
+CALCULATE(
+    COUNTROWS(fact_action_recommendations),
+    fact_action_recommendations[reason_group] = "review"
+)

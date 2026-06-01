@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Local outputs / data
+/artifacts/
+/reports/
+
+# Ignore data contents, but allow DVC metadata files
+/data/**
+!/data/*.dvc
+!/data/**/*.dvc
+
+# Ignore raw/generated file types unless tracked by DVC
+*.csv
+*.parquet
+*.feather
+*.joblib
+*.pkl
+!*.dvc
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# DVC local files
+.dvc/tmp/
+.dvc/config.local
+
+# Local databases
+*.duckdb
+analytics_sql/*.duckdb

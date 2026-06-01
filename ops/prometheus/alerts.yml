@@ -1,0 +1,29 @@
+groups:
+  - name: api-essential
+    rules:
+      - alert: ApiDown
+        expr: up{job="m5-api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "API is down"
+          description: "Prometheus cannot scrape the /metrics endpoint for m5-api."
+
+      - alert: ApiHigh5xxRate
+        expr: sum(rate(http_errors_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "High 5xx rate"
+          description: "5xx responses > 0.2/sec for 5 minutes. Check logs and upstream dependencies."
+
+      - alert: ApiHighLatencyP95
+        expr: histogram_quantile(0.95, sum(rate(http_request_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "High p95 latency"
+          description: "p95 latency > 1s for 10 minutes. Consider scaling workers or optimizing heavy endpoints."

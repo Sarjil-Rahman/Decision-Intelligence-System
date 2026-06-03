@@ -1,0 +1,26 @@
+{
+  "title": "FastAPI Service Overview",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Request rate (req/s)",
+      "targets": [
+        {
+          "expr": "rate(http_requests_total[1m])"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate (5xx)",
+      "targets": [
+        {
+          "expr": "rate(http_requests_total{status=~\"5..\"}[5m])"
+        }
+      ]
+    }
+  ]
+}

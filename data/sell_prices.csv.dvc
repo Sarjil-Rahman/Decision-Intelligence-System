@@ -1,0 +1,5 @@
+outs:
+- md5: 08c591caa99e55daf3e0ccac913f7c85
+  size: 203395785
+  hash: md5
+  path: sell_prices.csv

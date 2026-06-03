@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m5-forecast-price-service"
+version = "0.2.0"
+description = "Production-style M5 forecasting + price optimisation + promo selection service (FastAPI)"
+requires-python = ">=3.10,<3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = ["api", "m5_pipeline", "monitoring", "agents"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100

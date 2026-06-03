@@ -1,0 +1,8 @@
+[Profit Uplift GBP] = [final_profit_projection] - [base_profit]
+
+[Profit Uplift %] =
+IF ABS([base_profit]) > 0 THEN
+    ([final_profit_projection] - [base_profit]) / ABS([base_profit])
+END
+
+[Needs Review?] = [reason_group] = "review"

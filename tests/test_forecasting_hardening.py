@@ -9,8 +9,10 @@ from m5_pipeline.m5_forecasting import (
     ForecastConfig,
     PromotionPolicy,
     _add_price_feats,
+    _fit_lgbm_with_inner_split,
     _fill_sell_price_future,
     _fill_sell_price_train,
+    _recursive_feature_rows,
     apply_conformal_intervals,
     build_conformal_interval_summary,
     evaluate_promotion_policy,
@@ -176,6 +178,142 @@ def test_recursive_predictions_use_previous_predictions_not_validation_actuals()
     )
     assert eval_rows["pred_lgbm"].tolist() == [3.0, 3.0, 3.0]
     assert eval_rows["actual"].tolist() == [100.0, 200.0, 300.0]
+
+
+def test_recursive_feature_builder_preserves_original_price_missingness_and_parity() -> None:
+    cfg = ForecastConfig(
+        data_dir="unused", lags=(1,), rolls=(2,), nonzero_rolls=(2,), two_stage=False
+    )
+    day_rows = pd.DataFrame(
+        {
+            "id": ["A"],
+            "date": [pd.Timestamp("2020-01-04")],
+            "sell_price": [5.0],
+            "price_was_missing": [1],
+            "price_imputation_source": ["last_training_price"],
+            "snap": [0],
+            "wday": [4],
+            "month": [1],
+            "year": [2020],
+            "item_id": ["I"],
+            "dept_id": ["D"],
+            "cat_id": ["C"],
+            "store_id": ["S"],
+            "state_id": ["ST"],
+            "weekday": ["Thu"],
+            "event_name_1": ["none"],
+            "event_type_1": ["none"],
+            "event_name_2": ["none"],
+            "event_type_2": ["none"],
+        }
+    )
+    cat_cols = [
+        "item_id",
+        "dept_id",
+        "cat_id",
+        "store_id",
+        "state_id",
+        "weekday",
+        "event_name_1",
+        "event_type_1",
+        "event_name_2",
+        "event_type_2",
+    ]
+    hist_sales = {"A": [1.0, 2.0, 3.0]}
+    hist_price = {"A": [4.0, 4.0, 5.0]}
+    first = _recursive_feature_rows(
+        day_rows,
+        hist_sales={k: list(v) for k, v in hist_sales.items()},
+        hist_price={k: list(v) for k, v in hist_price.items()},
+        cfg=cfg,
+        origin_date=pd.Timestamp("2020-01-01"),
+        cat_cols=cat_cols,
+    )
+    second = _recursive_feature_rows(
+        day_rows.copy(),
+        hist_sales={k: list(v) for k, v in hist_sales.items()},
+        hist_price={k: list(v) for k, v in hist_price.items()},
+        cfg=cfg,
+        origin_date=pd.Timestamp("2020-01-01"),
+        cat_cols=cat_cols,
+    )
+    assert first == second
+    assert first[0]["price_was_missing"] == 1
+    assert first[0]["price_imputation_source"] == "last_training_price"
+
+
+def test_lightgbm_resource_config_reaches_estimators(monkeypatch) -> None:
+    class FakeClassifier:
+        instances = []
+
+        def __init__(self, **params):
+            self.params = params
+            self.best_iteration_ = 7
+            FakeClassifier.instances.append(self)
+
+        def fit(self, *args, **kwargs):
+            return self
+
+        def get_params(self):
+            return dict(self.params)
+
+    class FakeRegressor:
+        instances = []
+
+        def __init__(self, **params):
+            self.params = params
+            self.best_iteration_ = 9
+            FakeRegressor.instances.append(self)
+
+        def fit(self, *args, **kwargs):
+            return self
+
+        def get_params(self):
+            return dict(self.params)
+
+    class FakeLgb:
+        LGBMClassifier = FakeClassifier
+        LGBMRegressor = FakeRegressor
+
+        @staticmethod
+        def early_stopping(rounds, verbose=False):
+            return ("early_stopping", rounds, verbose)
+
+    import m5_pipeline.m5_forecasting as forecasting
+
+    monkeypatch.setattr(forecasting, "lgb", FakeLgb)
+    train_df = pd.DataFrame(
+        {
+            "d": [f"d_{i}" for i in range(1, 9)],
+            "sales": [0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 1.0, 2.0],
+            "x": [float(i) for i in range(1, 9)],
+        }
+    )
+    cfg = ForecastConfig(
+        data_dir="unused",
+        two_stage=True,
+        classifier_n_estimators=123,
+        regressor_n_estimators=234,
+        classifier_early_stopping_rounds=11,
+        regressor_early_stopping_rounds=22,
+        n_jobs=2,
+        lightgbm_verbosity=1,
+    )
+    model, metadata = _fit_lgbm_with_inner_split(
+        train_df,
+        cfg=cfg,
+        feature_cols=["x"],
+        split=BacktestSplit("d_8", "d_9", "d_10", "d_4", "d_5", "d_6"),
+    )
+    clf, reg = model
+    assert FakeClassifier.instances[0].params["n_estimators"] == 123
+    assert FakeRegressor.instances[0].params["n_estimators"] == 234
+    assert clf.params["n_estimators"] == 7
+    assert reg.params["n_estimators"] == 9
+    assert clf.params["n_jobs"] == 2
+    assert reg.params["verbosity"] == 1
+    assert metadata["classifier_early_stopping_status"] == "used"
+    assert metadata["regressor_early_stopping_status"] == "used"
 
 
 def test_promotion_policy_rejects_low_aggregate_improvement() -> None:

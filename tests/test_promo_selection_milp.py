@@ -116,9 +116,16 @@ def test_no_change_candidate_is_only_added_when_explicitly_allowed(tmp_path):
     )
 
     out = pd.read_csv(res["promo_path"])
+    candidates = pd.read_csv(res["candidate_path"])
+    assert len(out) == 3
+    assert out["id"].is_unique
+    assert len(candidates) == 6
     assert "selected" in out.columns
     assert (np.abs(out.loc[out["selected"] == 1, "chosen_delta"]) <= 1e-9).all()
     assert int(out["selected"].sum()) == 0
+    assert res["summary"]["base_profit_gbp"] == pytest.approx(3 * 400.0)
+    assert res["summary"]["constrained_profit_gbp"] == pytest.approx(3 * 400.0)
+    assert res["summary"]["base_demand_28d"] == pytest.approx(3 * 100.0)
 
 
 def test_milp_can_choose_second_best_local_action_for_global_portfolio(tmp_path):
@@ -153,3 +160,30 @@ def test_milp_can_choose_second_best_local_action_for_global_portfolio(tmp_path)
     selected = _selected_rows(res["promo_path"])
     assert selected["id"].is_unique
     assert float((selected["selected"] * selected["promo_spend_proxy"]).sum()) <= 120.0 + 1e-6
+
+
+def test_promo_outputs_split_candidates_from_one_decision_per_item(tmp_path):
+    pytest.importorskip("pulp")
+    _write_price_opt_input(tmp_path, n=4)
+
+    res = run_promo_selection(
+        PromoSelectionConfig(
+            data_dir=str(tmp_path),
+            max_price_changes_total=2,
+            max_price_changes_per_store=None,
+            max_price_changes_per_cat=None,
+            promo_discount_grid=(-0.20, -0.10, -0.05),
+            write_reports=True,
+        )
+    )
+
+    decisions = pd.read_csv(res["promo_path"])
+    candidates = pd.read_csv(res["candidate_path"])
+    assert decisions["id"].is_unique
+    assert len(decisions) == 4
+    assert len(candidates) == 12
+    assert res["candidate_n"] == 12
+    assert res["constraint_report"]["candidate_count"] == 12
+    assert decisions["base_profit"].sum() == pytest.approx(4 * 400.0)
+    assert res["summary"]["base_profit_gbp"] == pytest.approx(4 * 400.0)
+    assert res["summary"]["base_profit_gbp"] != pytest.approx(candidates["base_profit"].sum())

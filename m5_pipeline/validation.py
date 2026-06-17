@@ -337,7 +337,7 @@ def validate_m5_inputs(cfg: ValidationConfig) -> Dict[str, Any]:
         # (vectorised check on a small sample first is cheaper; then full if needed)
         vals = sales[day_cols]
         _value_range(
-            vals.stack(dropna=False),
+            pd.Series(vals.to_numpy().ravel()),
             name="sales_train_validation.csv.sales",
             ge=0,
             le=cfg.max_abs_sales,

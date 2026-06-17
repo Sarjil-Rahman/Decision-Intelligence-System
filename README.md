@@ -35,7 +35,6 @@ This repository is built to show the kind of ownership employers look for in **D
 
 ## What this project is really about
 
-This is **not just a forecasting notebook**.
 
 It is a retail decision-support system that answers a more business-relevant question:
 
@@ -51,14 +50,7 @@ That framing matters because businesses do not buy RMSE. They buy:
 
 ---
 
-## Why this is stronger than a typical ML portfolio repo
 
-Many portfolio projects stop at:
-
-* feature engineering
-* model training
-* a metric table
-* maybe a dashboard screenshot
 
 This repository goes further by adding:
 
@@ -343,19 +335,24 @@ More realistic heavier run:
 
 ```json
 {
-  "data_dir": "data",
-  "max_series": 200,
-  "start_d": "d_1500",
-  "last_train_d": "d_1913",
-  "horizon": 28,
-  "objective": "tweedie",
-  "tweedie_variance_power": 1.1,
-  "two_stage": true,
-  "split_strategy": "rolling_origin",
-  "n_backtests": 3,
-  "backtest_stride": 28,
-  "validate_inputs": true,
-  "save_artifacts": true
+  "dataset_id": "m5_local",
+  "params": {
+    "max_series": 200,
+    "start_d": "d_1500",
+    "last_train_d": "d_1913",
+    "horizon": 28,
+    "objective": "tweedie",
+    "tweedie_variance_power": 1.1,
+    "two_stage": true,
+    "split_strategy": "rolling_origin",
+    "n_backtests": 3,
+    "backtest_stride": 28,
+    "n_jobs": 1,
+    "classifier_n_estimators": 500,
+    "regressor_n_estimators": 800,
+    "validate_inputs": true,
+    "save_artifacts": true
+  }
 }
 ```
 
@@ -387,7 +384,6 @@ Payload:
 {
   "dataset_id": "m5_local",
   "params": {
-    "submission_path": "submission.csv",
     "last_train_d": "d_1913",
     "margin": 0.3,
     "lookback_days": 365
@@ -403,8 +399,9 @@ Main outputs:
 
 Important path note:
 
-* `submission_path` is interpreted **relative to `data_dir`**
-* so when `data_dir` is `"data"`, use `"submission.csv"`, not `"data/submission.csv"`
+* public `/v1/jobs/price-actions` does not accept `submission_path`, `out_path`, or `data_dir`
+* it reads `submission.csv` and writes `price_optimization_results.csv` server-side under the authorized `dataset_id` directory
+* trusted `/internal/*` development endpoints keep path compatibility and should not be publicly exposed
 
 Business meaning:
 
@@ -429,7 +426,6 @@ Payload:
 {
   "dataset_id": "m5_local",
   "params": {
-    "input_path": "price_optimization_results.csv",
     "max_price_changes_total": 5000,
     "budget": null,
     "objective": "profit"
@@ -439,13 +435,14 @@ Payload:
 
 Main outputs:
 
-* `data/promo_selection_results.csv`
+* `data/promo_action_candidates.csv` with one row per item-action candidate
+* `data/promo_selection_results.csv` with exactly one final decision row per item
 * `data/reports/promo_selection_summary.json`
 
 Important path note:
 
-* `input_path` is interpreted **relative to `data_dir`**
-* so use `"price_optimization_results.csv"`, not `"data/price_optimization_results.csv"`
+* public `/v1/jobs/promo-selection` does not accept `input_path`, `out_path`, or `data_dir`
+* it reads `price_optimization_results.csv` and writes promotion outputs server-side under the authorized `dataset_id` directory
 
 Business meaning:
 
@@ -780,11 +777,31 @@ Under `data/reports/dashboard_ready/`, for example:
 * `fact_uplift_backtest.csv`
 * `dim_reason_codes.csv`
 * `dim_kpi_dictionary.csv`
+* generated dashboard mockups, when produced, are written under the ignored `data/reports/dashboard_ready/` area
 
 ### Stakeholder documentation
 
 * `data/docs/kpi_dictionary.md`
 * `data/docs/user_guide.md`
+
+---
+
+## Practical Difficulties Faced Building This
+
+The hardest part of this project was not getting a model to produce a forecast. The difficult part was making the forecast, price optimiser, constrained promotion selector, API jobs, and warehouse all agree on the same business truth without quietly double-counting value or overstating evidence.
+
+A few issues only became obvious from building the full chain end to end:
+
+* The promotion optimiser works on item-action candidates, but the business needs one final decision per item. Keeping those two grains separate is essential; otherwise base profit, demand, and revenue can be multiplied by the number of candidate actions.
+* Recursive forecasting is easy to make look accurate if validation actuals leak into lag features. The project uses deployment-style recursive evaluation so future steps are built from prior predictions, not from the answers.
+* Price data has its own leakage risk. Missingness has to be recorded before imputation, because recalculating it after filling prices makes the model think a carried-forward price was observed.
+* Model promotion cannot be based on one flattering split. The serving decision uses aggregate backtest policy, win rate, and regression checks, while reports and warehouse outputs consume that same decision.
+* Offline price simulations are useful for screening risk, but they are not causal proof. The project keeps observational and randomized-experiment language separate so the business story does not overclaim.
+* Public async jobs need a different contract from trusted local scripts. The API accepts `dataset_id` and safe modelling parameters, while filesystem paths are generated server-side and revalidated in the worker.
+* Warehouse work is mostly about grain discipline and reproducibility. Facts, marts, and manifests need row counts and idempotent run behavior; otherwise the SQL layer can look polished while carrying duplicated or stale rows.
+* Resource controls matter in real environments. LightGBM settings need bounded defaults for workers and CI, while still allowing deliberate larger runs from the CLI.
+
+These are the kinds of details that turn a modelling repo into a decision-system repo: not more infrastructure, but better contracts between modelling, optimization, reporting, and operations.
 
 ---
 
@@ -825,8 +842,6 @@ This project is especially relevant for roles such as:
 ---
 
 ## Limitations
-
-A strong README states limitations clearly.
 
 Current limitations of the sample output story may include:
 

@@ -41,10 +41,27 @@ def resolve_dataset_file(dataset_dir: str | Path, filename: str) -> Path:
         candidate.relative_to(root)
     except ValueError as exc:
         raise ValueError("file path resolves outside the authorised dataset.") from exc
+    if candidate.exists() and not candidate.is_file():
+        raise ValueError("file path must resolve to a regular file.")
     return candidate
 
 
 def validate_required_dataset_files(dataset_dir: str | Path) -> None:
-    missing = [name for name in REQUIRED_M5_FILES if not (Path(dataset_dir) / name).exists()]
-    if missing:
-        raise FileNotFoundError("Missing required dataset files: " + ", ".join(missing))
+    root = Path(dataset_dir).resolve()
+    missing_or_invalid: list[str] = []
+    escaped: list[str] = []
+    for name in REQUIRED_M5_FILES:
+        candidate = (root / name).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            escaped.append(name)
+            continue
+        if not candidate.is_file():
+            missing_or_invalid.append(name)
+    if escaped:
+        raise ValueError(
+            "Required dataset file resolves outside the authorised dataset: " + ", ".join(escaped)
+        )
+    if missing_or_invalid:
+        raise FileNotFoundError("Missing required dataset files: " + ", ".join(missing_or_invalid))

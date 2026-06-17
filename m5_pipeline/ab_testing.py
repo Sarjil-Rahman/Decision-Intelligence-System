@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Tuple, Sequence, Optional
+from statistics import NormalDist
+from typing import Dict, Any, Tuple, Sequence, Optional, Literal
 
 import json
 import hashlib
@@ -355,18 +356,27 @@ def approximate_sample_size_per_group(
     minimum_detectable_effect: float,
     alpha: float = 0.05,
     power: float = 0.80,
+    sidedness: Literal["two-sided", "one-sided"] = "two-sided",
 ) -> Dict[str, Any]:
     if baseline_std <= 0 or minimum_detectable_effect <= 0:
         raise ValueError("baseline_std and minimum_detectable_effect must be positive")
-    # Normal approximation using common z values for alpha=.05 and power=.80 by default.
-    z_alpha = 1.96 if abs(alpha - 0.05) < 1e-12 else 1.96
-    z_power = 0.84 if abs(power - 0.80) < 1e-12 else 0.84
+    if not 0.0 < float(alpha) < 1.0:
+        raise ValueError("alpha must be between 0 and 1")
+    if not 0.0 < float(power) < 1.0:
+        raise ValueError("power must be between 0 and 1")
+    if sidedness not in {"two-sided", "one-sided"}:
+        raise ValueError("sidedness must be 'two-sided' or 'one-sided'")
+    normal = NormalDist()
+    alpha_tail = float(alpha) / 2.0 if sidedness == "two-sided" else float(alpha)
+    z_alpha = normal.inv_cdf(1.0 - alpha_tail)
+    z_power = normal.inv_cdf(float(power))
     n = int(np.ceil(2 * ((z_alpha + z_power) * baseline_std / minimum_detectable_effect) ** 2))
     return {
         "sample_size_per_group": n,
         "assumptions": {
-            "two_sided_alpha": float(alpha),
+            "alpha": float(alpha),
             "power": float(power),
+            "sidedness": sidedness,
             "baseline_std": float(baseline_std),
             "minimum_detectable_effect": float(minimum_detectable_effect),
             "method": "normal_approximation_two_sample_means",
@@ -433,7 +443,11 @@ def analyse_randomized_price_experiment(
 
     return {
         "evidence_type": "randomized_experiment",
-        "causal_validated": True,
+        "causal_validated": False,
+        "causal_validation_note": (
+            "Treatment/control labels are present, but this function cannot verify assignment "
+            "integrity, interference, or experiment execution from labels alone."
+        ),
         "estimator": "difference_in_mean_pre_post_changes",
         "estimate": estimate,
         "bootstrap_ci_95": ci,

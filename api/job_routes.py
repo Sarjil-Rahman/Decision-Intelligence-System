@@ -5,27 +5,23 @@ from uuid import uuid4
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from api.datasets import resolve_dataset_dir, validate_required_dataset_files
+from api.job_schemas import (
+    BusinessPackJobSubmitRequest,
+    ForecastJobSubmitRequest,
+    PriceActionsJobSubmitRequest,
+    PromoSelectionJobSubmitRequest,
+    payload_from_request,
+)
 from api.security import require_api_key
 from api.settings import ApiSettings, get_settings
 from worker import tasks
 from worker.celery_app import celery_app
 
-try:
-    from celery.result import AsyncResult
-except ImportError:  # pragma: no cover
-    AsyncResult = None  # type: ignore
-
-
 router = APIRouter(prefix="/v1/jobs", tags=["jobs"], dependencies=[Depends(require_api_key)])
 _EAGER_RESULTS: dict[str, dict[str, Any]] = {}
-
-
-class JobSubmitRequest(BaseModel):
-    dataset_id: str = Field(..., min_length=1, max_length=64)
-    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobSubmitResponse(BaseModel):
@@ -46,12 +42,20 @@ class JobStatusResponse(BaseModel):
     failure_message: str | None = None
 
 
-def _validate_submission(req: JobSubmitRequest, settings: ApiSettings) -> None:
+JobRequest = (
+    ForecastJobSubmitRequest
+    | PriceActionsJobSubmitRequest
+    | PromoSelectionJobSubmitRequest
+    | BusinessPackJobSubmitRequest
+)
+
+
+def _validate_submission(req: JobRequest, settings: ApiSettings) -> None:
     dataset_dir = resolve_dataset_dir(settings.data_root, req.dataset_id)
     validate_required_dataset_files(dataset_dir)
 
 
-def _submit(task, req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
+def _submit(task, req: JobRequest, request: Request) -> JobSubmitResponse:
     settings = get_settings()
     try:
         _validate_submission(req, settings)
@@ -59,7 +63,7 @@ def _submit(task, req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    payload = {"dataset_id": req.dataset_id, "params": req.params}
+    payload = payload_from_request(req)
     submitted_at = datetime.now(timezone.utc).isoformat()
     if settings.celery_task_always_eager:
         impl_by_name = {
@@ -97,28 +101,30 @@ def _submit(task, req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
 
 
 @router.post("/forecast", response_model=JobSubmitResponse, status_code=status.HTTP_202_ACCEPTED)
-def submit_forecast(req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
+def submit_forecast(req: ForecastJobSubmitRequest, request: Request) -> JobSubmitResponse:
     return _submit(tasks.forecast_task, req, request)
 
 
 @router.post(
     "/price-actions", response_model=JobSubmitResponse, status_code=status.HTTP_202_ACCEPTED
 )
-def submit_price_actions(req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
+def submit_price_actions(req: PriceActionsJobSubmitRequest, request: Request) -> JobSubmitResponse:
     return _submit(tasks.price_actions_task, req, request)
 
 
 @router.post(
     "/promo-selection", response_model=JobSubmitResponse, status_code=status.HTTP_202_ACCEPTED
 )
-def submit_promo_selection(req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
+def submit_promo_selection(
+    req: PromoSelectionJobSubmitRequest, request: Request
+) -> JobSubmitResponse:
     return _submit(tasks.promo_selection_task, req, request)
 
 
 @router.post(
     "/business-pack", response_model=JobSubmitResponse, status_code=status.HTTP_202_ACCEPTED
 )
-def submit_business_pack(req: JobSubmitRequest, request: Request) -> JobSubmitResponse:
+def submit_business_pack(req: BusinessPackJobSubmitRequest, request: Request) -> JobSubmitResponse:
     return _submit(tasks.business_pack_task, req, request)
 
 
@@ -142,11 +148,11 @@ def get_job_status(job_id: str) -> JobStatusResponse:
             finished_at=payload.get("finished_at"),
             result=payload.get("result"),
         )
-    if AsyncResult is None:
+    if celery_app is None:
         if job_id == "eager-local":
             return JobStatusResponse(job_id=job_id, status="succeeded")
         raise HTTPException(status_code=404, detail="Job backend is unavailable.")
-    result = AsyncResult(job_id)
+    result = celery_app.AsyncResult(job_id)
     state = str(result.state).upper()
     if state in {"PENDING", "RECEIVED"}:
         return JobStatusResponse(job_id=job_id, status="queued")

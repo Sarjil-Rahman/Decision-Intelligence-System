@@ -15,6 +15,7 @@ class PromoSelectionConfig:
     data_dir: str
     input_path: str = "price_optimization_results.csv"
     out_path: str = "promo_selection_results.csv"
+    candidate_out_path: str = "promo_action_candidates.csv"
 
     # Constraints for realism
     max_price_changes_total: Optional[int] = 5000
@@ -106,8 +107,16 @@ def _build_promo_summary(out: pd.DataFrame) -> Dict[str, Any]:
 
     return {
         "base_profit_gbp": base_profit_gbp,
+        "base_revenue_gbp": (
+            float(df["base_revenue"].sum()) if "base_revenue" in df.columns else float("nan")
+        ),
+        "base_demand_28d": float(df["base_demand_28d"].sum()),
         "optimised_profit_gbp": optimised_profit_gbp,
         "constrained_profit_gbp": constrained_profit_gbp,
+        "constrained_revenue_gbp": (
+            float(df["applied_revenue"].sum()) if "applied_revenue" in df.columns else float("nan")
+        ),
+        "constrained_demand_28d": float(df["applied_demand"].sum()),
         "delta_base_to_constrained_gbp": delta_base_to_constrained_gbp,
         "uplift_constrained_pct": uplift_constrained_pct,
         "uplift_distribution_gbp": uplift_dist_gbp,
@@ -183,6 +192,8 @@ def _validate_input_price_opt(df: pd.DataFrame) -> None:
 def _build_candidates(df: pd.DataFrame, cfg: PromoSelectionConfig) -> pd.DataFrame:
     """Build one row per item-action candidate; do not pre-collapse to a local best."""
     _validate_input_price_opt(df)
+    if "base_revenue" not in df.columns:
+        df["base_revenue"] = df["price"] * df["base_demand_28d"]
 
     base_p = df["price"].to_numpy(dtype=np.float64)
     base_q = df["base_demand_28d"].to_numpy(dtype=np.float64)
@@ -239,13 +250,16 @@ def _build_candidates(df: pd.DataFrame, cfg: PromoSelectionConfig) -> pd.DataFra
                 "price",
                 "cost",
                 "base_demand_28d",
+                "base_revenue",
                 "base_profit",
             ]
         ].copy()
         cand["action_id"] = cand["id"].astype(str) + f"::delta_{delta:.6f}"
         cand["new_price"] = cand_p
         cand["new_demand"] = cand_q
+        cand["new_revenue"] = cand_p * cand_q
         cand["new_profit"] = cand_profit
+        cand["revenue_gain"] = cand["new_revenue"] - cand["base_revenue"]
         cand["profit_gain"] = profit_gain
         cand["demand_gain"] = demand_gain
         cand["score"] = np.where(np.isfinite(score), score, 0.0)
@@ -468,6 +482,48 @@ def _constraint_report(out: pd.DataFrame, cfg: PromoSelectionConfig) -> Dict[str
     return rep
 
 
+def _build_item_decisions(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Collapse item-action candidates to exactly one final decision row per item."""
+    if candidates.empty:
+        return candidates.copy()
+
+    selected = candidates.loc[candidates["selected"] == 1].copy()
+    selected_ids = set(selected["id"].astype(str))
+    no_action_rows = []
+    for item_id, group in candidates.groupby("id", sort=False):
+        if str(item_id) in selected_ids:
+            continue
+        row = group.iloc[0].copy()
+        row["action_id"] = f"{item_id}::no_action"
+        row["new_price"] = row["price"]
+        row["new_demand"] = row["base_demand_28d"]
+        row["new_revenue"] = row.get("base_revenue", row["price"] * row["base_demand_28d"])
+        row["new_profit"] = row["base_profit"]
+        row["revenue_gain"] = 0.0
+        row["profit_gain"] = 0.0
+        row["demand_gain"] = 0.0
+        row["score"] = 0.0
+        row["chosen_delta"] = 0.0
+        row["promo_spend_proxy"] = 0.0
+        row["is_change"] = 0
+        row["selected"] = 0
+        row["eligible"] = int(group["eligible"].astype(int).max())
+        row["guardrail_reason"] = "no_selected_action"
+        no_action_rows.append(row)
+
+    pieces = [selected]
+    if no_action_rows:
+        pieces.append(pd.DataFrame(no_action_rows))
+    decisions = pd.concat(pieces, ignore_index=True)
+    decisions = decisions.sort_values("id").reset_index(drop=True)
+    if decisions["id"].duplicated().any():
+        duplicated = decisions.loc[decisions["id"].duplicated(), "id"].astype(str).tolist()
+        raise RuntimeError(
+            "Expected one promotion decision per item; duplicates: " + ", ".join(duplicated)
+        )
+    return decisions
+
+
 def _write(
     out: pd.DataFrame,
     cfg: PromoSelectionConfig,
@@ -484,6 +540,11 @@ def _write(
     out["applied_demand"] = np.where(
         out["selected"] == 1, out["new_demand"], out["base_demand_28d"]
     )
+    if "new_revenue" not in out.columns:
+        out["new_revenue"] = out["new_price"] * out["new_demand"]
+    if "base_revenue" not in out.columns:
+        out["base_revenue"] = out["price"] * out["base_demand_28d"]
+    out["applied_revenue"] = np.where(out["selected"] == 1, out["new_revenue"], out["base_revenue"])
     out["applied_profit"] = np.where(out["selected"] == 1, out["new_profit"], out["base_profit"])
     out["applied_is_change"] = (np.abs(out["applied_price"] - out["price"]) > 1e-9).astype(int)
 
@@ -495,12 +556,32 @@ def _write(
     rep["selected_item_count"] = int(out.loc[out["selected"] == 1, "id"].nunique())
     rep["selected_action_count"] = int(out["selected"].sum())
     out["constraint_violation"] = int(rep["any_violation"])
+    decisions = _build_item_decisions(out)
+    decisions["applied_price"] = np.where(
+        decisions["selected"] == 1, decisions["new_price"], decisions["price"]
+    )
+    decisions["applied_demand"] = np.where(
+        decisions["selected"] == 1, decisions["new_demand"], decisions["base_demand_28d"]
+    )
+    decisions["applied_revenue"] = np.where(
+        decisions["selected"] == 1, decisions["new_revenue"], decisions["base_revenue"]
+    )
+    decisions["applied_profit"] = np.where(
+        decisions["selected"] == 1, decisions["new_profit"], decisions["base_profit"]
+    )
+    decisions["applied_is_change"] = (
+        np.abs(decisions["applied_price"] - decisions["price"]) > 1e-9
+    ).astype(int)
+    decisions["constraint_violation"] = int(rep["any_violation"])
 
     # Stakeholder summary (constrained results)
-    summary = _build_promo_summary(out)
+    summary = _build_promo_summary(decisions)
 
+    candidate_path = os.path.join(cfg.data_dir, cfg.candidate_out_path)
+    out.to_csv(candidate_path, index=False)
+    get_logger("promo_select").info("Wrote: %s", candidate_path)
     out_path = os.path.join(cfg.data_dir, cfg.out_path)
-    out.to_csv(out_path, index=False)
+    decisions.to_csv(out_path, index=False)
     get_logger("promo_select").info("Wrote: %s", out_path)
 
     reports = {}
@@ -514,7 +595,7 @@ def _write(
         reports["promo_selection_summary"] = sum_path
 
         try:
-            df_store = out.groupby("store_id", as_index=False)[
+            df_store = decisions.groupby("store_id", as_index=False)[
                 ["base_profit", "applied_profit"]
             ].sum()
             df_store["uplift_gbp"] = df_store["applied_profit"] - df_store["base_profit"]
@@ -522,7 +603,9 @@ def _write(
             df_store.to_csv(store_csv, index=False)
             reports["constrained_uplift_by_store_csv"] = store_csv
 
-            df_cat = out.groupby("cat_id", as_index=False)[["base_profit", "applied_profit"]].sum()
+            df_cat = decisions.groupby("cat_id", as_index=False)[
+                ["base_profit", "applied_profit"]
+            ].sum()
             df_cat["uplift_gbp"] = df_cat["applied_profit"] - df_cat["base_profit"]
             cat_csv = os.path.join(rep_dir, "constrained_uplift_by_category.csv")
             df_cat.to_csv(cat_csv, index=False)
@@ -534,10 +617,12 @@ def _write(
 
     return {
         "promo_path": out_path,
+        "candidate_path": candidate_path,
         "method": method,
         "solver_status": solver_status,
         "fallback_reason": fallback_reason,
-        "n": int(len(out)),
+        "n": int(len(decisions)),
+        "candidate_n": int(len(out)),
         "constraint_report": rep,
         "summary": summary,
         "reports": reports,

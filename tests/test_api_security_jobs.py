@@ -76,6 +76,20 @@ def test_symlink_escape_is_rejected_where_supported(tmp_path: Path) -> None:
         resolve_dataset_file(data_dir, "link.csv")
 
 
+def test_required_dataset_symlink_escape_is_rejected_where_supported(tmp_path: Path) -> None:
+    data_dir = _write_dataset(tmp_path)
+    outside = tmp_path / "external_sell_prices.csv"
+    outside.write_text("store_id,item_id,wm_yr_wk,sell_price\ns,i,1,1.0\n", encoding="utf-8")
+    target = data_dir / "sell_prices.csv"
+    target.unlink()
+    try:
+        target.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not supported in this environment")
+    with pytest.raises(ValueError, match="outside"):
+        validate_required_dataset_files(data_dir)
+
+
 def test_job_submission_requires_api_key_in_production(tmp_path: Path, monkeypatch) -> None:
     _write_dataset(tmp_path)
     monkeypatch.setenv("API_ENV", "production")
@@ -98,6 +112,100 @@ def test_job_submission_requires_api_key_in_production(tmp_path: Path, monkeypat
     assert accepted.status_code == 202
     assert accepted.json()["status"] == "queued"
     assert "/v1/jobs/" in accepted.json()["status_url"]
+
+
+def test_public_job_params_reject_unknown_and_path_overrides(tmp_path: Path, monkeypatch) -> None:
+    _write_dataset(tmp_path)
+    monkeypatch.setenv("API_ENV", "production")
+    monkeypatch.setenv("API_KEY", "secret")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("CELERY_TASK_ALWAYS_EAGER", "true")
+    from api.settings import get_settings
+
+    get_settings.cache_clear()
+    from api.main import app
+
+    client = TestClient(app)
+    headers = {"X-API-Key": "secret"}
+    for params in [{"unknown": 1}, {"data_dir": str(tmp_path)}, {"out_submission": "x.csv"}]:
+        response = client.post(
+            "/v1/jobs/forecast",
+            json={"dataset_id": "demo", "params": params},
+            headers=headers,
+        )
+        assert response.status_code == 422
+
+    endpoint_params = [
+        ("/v1/jobs/price-actions", {"submission_path": str(tmp_path / "submission.csv")}),
+        ("/v1/jobs/price-actions", {"out_path": "elsewhere.csv"}),
+        ("/v1/jobs/promo-selection", {"input_path": "../price_optimization_results.csv"}),
+        ("/v1/jobs/promo-selection", {"out_path": "/tmp/promo.csv"}),
+        ("/v1/jobs/business-pack", {"reports_subdir": "../reports"}),
+        ("/v1/jobs/business-pack", {"data_dir": str(tmp_path)}),
+    ]
+    for endpoint, params in endpoint_params:
+        response = client.post(
+            endpoint,
+            json={"dataset_id": "demo", "params": params},
+            headers=headers,
+        )
+        assert response.status_code == 422
+
+    response = client.post(
+        "/v1/jobs/forecast",
+        json={"dataset_id": "demo", "params": {"max_series": 1, "n_jobs": 1}},
+        headers=headers,
+    )
+    assert response.status_code == 202
+
+
+def test_worker_revalidates_payload_and_sanitizes_failures(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    from api.settings import get_settings
+    from worker import tasks
+
+    get_settings.cache_clear()
+    payload = {
+        "dataset_id": "demo",
+        "params": {"data_dir": r"C:\secret\m5", "out_path": "/tmp/leak.csv"},
+    }
+    result = tasks._task_wrapper(tasks._forecast_impl, payload)
+    assert result["status"] == "failed"
+    assert "C:\\secret" not in result["message"]
+    assert "/tmp/leak.csv" not in result["message"]
+    assert "Traceback" not in result["message"]
+    sanitized = tasks._sanitize_public_error(
+        "boom redis://:pw@localhost:6379/0 postgresql://u:p@host/db api_key=abc123"
+    )
+    assert "redis://" not in sanitized
+    assert "postgresql://" not in sanitized
+    assert "abc123" not in sanitized
+
+
+def test_status_lookup_uses_configured_celery_app(monkeypatch) -> None:
+    from api import job_routes
+
+    calls = []
+
+    class FakeResult:
+        state = "SUCCESS"
+        result = {
+            "status": "succeeded",
+            "started_at": "2020-01-01T00:00:00+00:00",
+            "finished_at": "2020-01-01T00:00:01+00:00",
+            "result": {"ok": True},
+        }
+
+    class FakeCeleryApp:
+        def AsyncResult(self, job_id):
+            calls.append(job_id)
+            return FakeResult()
+
+    monkeypatch.setattr(job_routes, "celery_app", FakeCeleryApp())
+    response = job_routes.get_job_status("abc123")
+    assert calls == ["abc123"]
+    assert response.status == "succeeded"
+    assert response.result == {"ok": True}
 
 
 def test_sync_endpoint_is_disabled_by_default(monkeypatch) -> None:

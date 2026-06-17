@@ -53,7 +53,7 @@ def test_no_effect_experiment_estimate_is_zero() -> None:
         _experiment_frame(effect=0.0), n_boot=100, n_perm=100
     )
     assert abs(result["estimate"]) < 1e-12
-    assert result["causal_validated"] is True
+    assert result["causal_validated"] is False
 
 
 def test_known_synthetic_treatment_effect_is_recovered() -> None:
@@ -67,6 +67,33 @@ def test_sample_size_returns_assumptions() -> None:
     out = approximate_sample_size_per_group(baseline_std=10.0, minimum_detectable_effect=2.0)
     assert out["sample_size_per_group"] > 0
     assert out["assumptions"]["method"] == "normal_approximation_two_sample_means"
+    strict_alpha = approximate_sample_size_per_group(
+        baseline_std=10.0, minimum_detectable_effect=2.0, alpha=0.01
+    )
+    high_power = approximate_sample_size_per_group(
+        baseline_std=10.0, minimum_detectable_effect=2.0, power=0.90
+    )
+    one_sided = approximate_sample_size_per_group(
+        baseline_std=10.0,
+        minimum_detectable_effect=2.0,
+        alpha=0.05,
+        power=0.80,
+        sidedness="one-sided",
+    )
+    assert strict_alpha["sample_size_per_group"] > out["sample_size_per_group"]
+    assert high_power["sample_size_per_group"] > out["sample_size_per_group"]
+    assert one_sided["sample_size_per_group"] < out["sample_size_per_group"]
+
+
+def test_sample_size_rejects_invalid_ranges() -> None:
+    with pytest.raises(ValueError, match="alpha"):
+        approximate_sample_size_per_group(
+            baseline_std=10.0, minimum_detectable_effect=2.0, alpha=1.0
+        )
+    with pytest.raises(ValueError, match="power"):
+        approximate_sample_size_per_group(
+            baseline_std=10.0, minimum_detectable_effect=2.0, power=0.0
+        )
 
 
 def test_invalid_experiment_assignment_fails() -> None:

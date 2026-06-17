@@ -2,23 +2,54 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Callable
 
-from api.datasets import resolve_dataset_dir, resolve_dataset_file, validate_required_dataset_files
+from pydantic import ValidationError
+
+from api.datasets import resolve_dataset_dir, validate_required_dataset_files
+from api.job_schemas import (
+    BusinessPackJobSubmitRequest,
+    ForecastJobSubmitRequest,
+    PriceActionsJobSubmitRequest,
+    PromoSelectionJobSubmitRequest,
+)
 from api.settings import get_settings
 from m5_pipeline.business_outputs import BusinessPackConfig, generate_business_pack
 from m5_pipeline.m5_forecasting import ForecastConfig, run_forecast
 from m5_pipeline.m5_price_optimization import PriceOptConfig, run_price_optimization
 from m5_pipeline.m5_promo_selection import PromoSelectionConfig, run_promo_selection
+from m5_pipeline.utils import get_logger
 from worker.celery_app import celery_app
+
+logger = get_logger("worker.tasks")
+
+
+def _sanitize_public_error(message: str) -> str:
+    text = str(message or "Task failed.")
+    text = re.sub(r"redis://[^\s]+", "<redis-url>", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(postgresql|postgres|mysql|mariadb|sqlite)://[^\s]+",
+        "<database-url>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(?i)(api[_-]?key|x-api-key|token|secret)=([^\s,;]+)", r"\1=<redacted>", text)
+    text = re.sub(r"[A-Za-z]:\\[^\s,;:)]+", "<path>", text)
+    text = re.sub(r"(?<!:)/(?:[^/\s,;:)]+/)+[^\s,;:)]+", "<path>", text)
+    text = " ".join(text.split())
+    if "Traceback (most recent call last)" in text:
+        return "Task failed."
+    return text[:500] or "Task failed."
 
 
 def _safe_failure(exc: BaseException) -> dict[str, Any]:
+    logger.exception("Async job failed")
     return {
         "status": "failed",
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "error": type(exc).__name__,
-        "message": str(exc).replace(str(Path.cwd()), "<workspace>"),
+        "message": _sanitize_public_error(str(exc)),
     }
 
 
@@ -37,50 +68,74 @@ def _run_dataset_job(dataset_id: str, func: Callable[[Path], dict[str, Any]]) ->
 
 
 def _forecast_impl(payload: dict[str, Any]) -> dict[str, Any]:
+    job = ForecastJobSubmitRequest.model_validate(payload)
+
     def run(dataset_dir: Path) -> dict[str, Any]:
-        cfg = ForecastConfig(data_dir=str(dataset_dir), **payload.get("params", {}))
+        cfg = ForecastConfig(
+            data_dir=str(dataset_dir),
+            out_submission="submission.csv",
+            **job.params.model_dump(exclude_none=True),
+        )
         res = run_forecast(cfg)
         return {
             "winner": res.get("winner"),
             "selected_baseline": res.get("selected_baseline"),
             "promotion": res.get("promotion"),
+            "prediction_intervals": res.get("prediction_intervals", {}),
             "submission_filename": Path(str(res.get("submission_path"))).name,
         }
 
-    return _run_dataset_job(payload["dataset_id"], run)
+    return _run_dataset_job(job.dataset_id, run)
 
 
 def _price_actions_impl(payload: dict[str, Any]) -> dict[str, Any]:
+    job = PriceActionsJobSubmitRequest.model_validate(payload)
+
     def run(dataset_dir: Path) -> dict[str, Any]:
-        params = dict(payload.get("params", {}))
-        if "submission_path" in params:
-            params["submission_path"] = resolve_dataset_file(
-                dataset_dir, params["submission_path"]
-            ).name
-        cfg = PriceOptConfig(data_dir=str(dataset_dir), **params)
+        params = job.params.model_dump(exclude_none=True)
+        elasticity_clip = (
+            float(params.pop("elasticity_clip_low")),
+            float(params.pop("elasticity_clip_high")),
+        )
+        cfg = PriceOptConfig(
+            data_dir=str(dataset_dir),
+            submission_path="submission.csv",
+            out_path="price_optimization_results.csv",
+            elasticity_clip=elasticity_clip,
+            **params,
+        )
         res = run_price_optimization(cfg)
         return {"n": res.get("n"), "summary": res.get("summary", {})}
 
-    return _run_dataset_job(payload["dataset_id"], run)
+    return _run_dataset_job(job.dataset_id, run)
 
 
 def _promo_selection_impl(payload: dict[str, Any]) -> dict[str, Any]:
+    job = PromoSelectionJobSubmitRequest.model_validate(payload)
+
     def run(dataset_dir: Path) -> dict[str, Any]:
-        params = dict(payload.get("params", {}))
-        if "input_path" in params:
-            params["input_path"] = resolve_dataset_file(dataset_dir, params["input_path"]).name
-        cfg = PromoSelectionConfig(data_dir=str(dataset_dir), **params)
+        cfg = PromoSelectionConfig(
+            data_dir=str(dataset_dir),
+            input_path="price_optimization_results.csv",
+            out_path="promo_selection_results.csv",
+            candidate_out_path="promo_action_candidates.csv",
+            **job.params.model_dump(exclude_none=True),
+        )
         res = run_promo_selection(cfg)
         return {
             "method": res.get("method"),
             "solver_status": res.get("solver_status"),
+            "candidate_n": res.get("candidate_n"),
+            "n": res.get("n"),
             "constraint_report": res.get("constraint_report", {}),
         }
 
-    return _run_dataset_job(payload["dataset_id"], run)
+    return _run_dataset_job(job.dataset_id, run)
 
 
 def _business_pack_impl(payload: dict[str, Any]) -> dict[str, Any]:
+    job = BusinessPackJobSubmitRequest.model_validate(payload)
+
     def run(dataset_dir: Path) -> dict[str, Any]:
         res = generate_business_pack(BusinessPackConfig(data_dir=str(dataset_dir)))
         return {
@@ -88,7 +143,7 @@ def _business_pack_impl(payload: dict[str, Any]) -> dict[str, Any]:
             "exports": sorted(res.get("dashboard_exports", {})),
         }
 
-    return _run_dataset_job(payload["dataset_id"], run)
+    return _run_dataset_job(job.dataset_id, run)
 
 
 def _task_wrapper(
@@ -96,7 +151,7 @@ def _task_wrapper(
 ) -> dict[str, Any]:
     try:
         return func(payload)
-    except (FileNotFoundError, ValueError, ImportError, RuntimeError) as exc:
+    except (FileNotFoundError, ValueError, ValidationError, ImportError, RuntimeError) as exc:
         return _safe_failure(exc)
 
 

@@ -39,6 +39,8 @@ def cleanup_run_tables(con: duckdb.DuckDBPyConnection, run_id: str) -> None:
         "fact_sell_price",
         "fact_retail_daily_kpis",
         "fact_price_actions",
+        "fact_promo_action_candidates",
+        "fact_promo_item_decisions",
         "agg_uplift_by_store",
         "agg_uplift_by_category",
         "fact_kpis",
@@ -359,6 +361,122 @@ def _load_business_pack(
         out = price_df[cols].copy()
         out.insert(0, "run_id", run_id)
         _register_insert(con, "fact_price_actions", out)
+    else:
+        manifest.setdefault("warnings", []).append("Missing optional price action artefact")
+
+    promo_candidate_path = reports_dir.parent / "promo_action_candidates.csv"
+    if promo_candidate_path.exists():
+        candidate_df = pd.read_csv(promo_candidate_path)
+        cols = [
+            "id",
+            "action_id",
+            "store_id",
+            "item_id",
+            "cat_id",
+            "price",
+            "new_price",
+            "base_demand_28d",
+            "new_demand",
+            "base_revenue",
+            "new_revenue",
+            "base_profit",
+            "new_profit",
+            "profit_gain",
+            "demand_gain",
+            "chosen_delta",
+            "promo_spend_proxy",
+            "eligible",
+            "selected",
+            "is_change",
+        ]
+        for col in cols:
+            if col not in candidate_df.columns:
+                candidate_df[col] = None
+        out = candidate_df[cols].copy()
+        out.insert(0, "run_id", run_id)
+        _register_insert(con, "fact_promo_action_candidates", out)
+    else:
+        manifest.setdefault("warnings", []).append(
+            "Missing optional promo action candidate artefact"
+        )
+
+    promo_decision_path = reports_dir.parent / "promo_selection_results.csv"
+    if promo_decision_path.exists():
+        decision_df = pd.read_csv(promo_decision_path)
+        cols = [
+            "id",
+            "action_id",
+            "store_id",
+            "item_id",
+            "cat_id",
+            "price",
+            "applied_price",
+            "base_demand_28d",
+            "applied_demand",
+            "base_revenue",
+            "applied_revenue",
+            "base_profit",
+            "applied_profit",
+            "profit_gain",
+            "demand_gain",
+            "chosen_delta",
+            "promo_spend_proxy",
+            "selected",
+            "eligible",
+            "applied_is_change",
+            "constraint_violation",
+        ]
+        for col in cols:
+            if col not in decision_df.columns:
+                decision_df[col] = None
+        out = decision_df[cols].copy()
+        out.insert(0, "run_id", run_id)
+        _register_insert(con, "fact_promo_item_decisions", out)
+    else:
+        manifest.setdefault("warnings", []).append("Missing optional promo item decision artefact")
+
+
+def _loaded_row_counts(con: duckdb.DuckDBPyConnection, run_id: str) -> dict[str, int]:
+    run_scoped = [
+        "fact_daily_sales",
+        "fact_sell_price",
+        "fact_retail_daily_kpis",
+        "fact_price_actions",
+        "fact_promo_action_candidates",
+        "fact_promo_item_decisions",
+        "agg_uplift_by_store",
+        "agg_uplift_by_category",
+        "fact_kpis",
+        "fact_scenario_comparison",
+        "fact_action_recommendations",
+        "agg_reason_code_mix",
+        "agg_store_action_summary",
+        "agg_category_action_summary",
+        "fact_uplift_backtest",
+        "fact_kpi_anomalies",
+        "runs",
+        "dim_run",
+    ]
+    dimensions = [
+        "dim_date",
+        "dim_item",
+        "dim_store",
+        "dim_product_store",
+        "dim_reason_codes",
+        "dim_kpi_dictionary",
+    ]
+    counts: dict[str, int] = {}
+    for table in run_scoped:
+        count = int(
+            con.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id = ?", [run_id]).fetchone()[0]
+        )
+        if count:
+            counts[table] = count
+    for table in dimensions:
+        count = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if count:
+            counts[table] = count
+    return dict(sorted(counts.items()))
 
 
 def build_warehouse(
@@ -437,13 +555,7 @@ def build_warehouse(
     _load_business_pack(con, reports_path, run_id, manifest)
     anomalies = write_kpi_anomalies(con, run_id=run_id, threshold=anomaly_threshold)
 
-    row_counts = {
-        "dim_date": len(calendar),
-        "dim_product_store": len(products),
-        "fact_daily_sales": len(daily_sales),
-        "fact_retail_daily_kpis": len(daily_kpis),
-        "fact_kpi_anomalies": len(anomalies),
-    }
+    row_counts = _loaded_row_counts(con, run_id)
     views = [
         row[0]
         for row in con.execute(

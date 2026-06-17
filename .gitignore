@@ -56,3 +56,5 @@ analytics_sql/*.duckdb
 # Local Codex/task control files
 prompt.md
 codexset
+FIXES_APPLIED.md
+BUSINESS_PACK_CHANGES.md

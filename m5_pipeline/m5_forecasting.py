@@ -15,7 +15,6 @@ from .utils import get_logger, require_files, write_json, select_representative_
 from .validation import (
     ValidationConfig,
     validate_m5_inputs,
-    add_segment_metrics,
     data_quality_report,
 )
 
@@ -110,7 +109,9 @@ class ForecastConfig:
     # Model
     objective: str = "tweedie"  # "tweedie" tends to work well for sparse retail
     tweedie_variance_power: float = 1.1  # 1.1–1.3 common
-    n_estimators: int = 4000
+    n_estimators: int = 800
+    classifier_n_estimators: int = 500
+    regressor_n_estimators: Optional[int] = None
     learning_rate: float = 0.03
     num_leaves: int = 128
     min_data_in_leaf: int = 100
@@ -118,9 +119,13 @@ class ForecastConfig:
     colsample_bytree: float = 0.8
     reg_lambda: float = 1.0
     random_state: int = 42
+    n_jobs: int = 1
+    lightgbm_verbosity: int = -1
     two_stage: bool = True  # P(y>0) × E[y|y>0] for intermittent demand (recommended for M5)
 
     early_stopping_rounds: int = 200
+    classifier_early_stopping_rounds: int = 50
+    regressor_early_stopping_rounds: Optional[int] = None
 
     # Features (past-only)
     lags: Tuple[int, ...] = (1, 7, 28, 56, 364)
@@ -128,6 +133,24 @@ class ForecastConfig:
 
     # Intermittency features
     nonzero_rolls: Tuple[int, ...] = (7, 28, 56)
+
+
+def _regressor_n_estimators(cfg: ForecastConfig) -> int:
+    return int(cfg.regressor_n_estimators or cfg.n_estimators)
+
+
+def _regressor_early_stopping_rounds(cfg: ForecastConfig) -> int:
+    return int(
+        cfg.regressor_early_stopping_rounds
+        if cfg.regressor_early_stopping_rounds is not None
+        else cfg.early_stopping_rounds
+    )
+
+
+def _early_stopping_callbacks(rounds: int) -> list[Any]:
+    if int(rounds) <= 0:
+        return []
+    return [lgb.early_stopping(int(rounds), verbose=False)]
 
 
 def _d_to_int(d: str) -> int:
@@ -606,6 +629,7 @@ def _recursive_feature_rows(
             "price_change_count_28": price_change_count_28,
             "weeks_since_price_change": float(days_since_change / 7.0),
             "price_was_missing": int(getattr(r, "price_was_missing", int(pd.isna(raw_price)))),
+            "price_imputation_source": getattr(r, "price_imputation_source", "unknown"),
             "t": int((day - origin_date).days),
             "days_since_last_sale": days_since_last_sale(),
             "snap": int(getattr(r, "snap")),
@@ -1026,6 +1050,8 @@ def _fit_lgbm_with_inner_split(
         "inner_valid_start_d": split.inner_valid_start_d,
         "inner_valid_end_d": split.inner_valid_end_d,
         "used_inner_early_stopping": False,
+        "classifier_early_stopping_status": "not_applicable",
+        "regressor_early_stopping_status": "not_attempted",
         "chosen_classifier_iterations": None,
         "chosen_regressor_iterations": None,
     }
@@ -1056,7 +1082,8 @@ def _fit_lgbm_with_inner_split(
             colsample_bytree=0.8,
             reg_lambda=1.0,
             random_state=cfg.random_state,
-            n_jobs=-1,
+            n_jobs=cfg.n_jobs,
+            verbosity=cfg.lightgbm_verbosity,
         )
 
     def reg_params(n_estimators: int) -> Dict[str, Any]:
@@ -1070,15 +1097,16 @@ def _fit_lgbm_with_inner_split(
             colsample_bytree=cfg.colsample_bytree,
             reg_lambda=cfg.reg_lambda,
             random_state=cfg.random_state,
-            n_jobs=-1,
+            n_jobs=cfg.n_jobs,
+            verbosity=cfg.lightgbm_verbosity,
         )
         if cfg.objective == "tweedie":
             params["tweedie_variance_power"] = cfg.tweedie_variance_power
         return params
 
     if cfg.two_stage:
-        clf_iters = 2000
-        reg_iters = int(cfg.n_estimators)
+        clf_iters = int(cfg.classifier_n_estimators)
+        reg_iters = _regressor_n_estimators(cfg)
         if inner_available:
             X_inner_train = inner_train[feature_cols]
             y_inner_train = inner_train["sales"].to_numpy(dtype=np.float64)
@@ -1088,36 +1116,58 @@ def _fit_lgbm_with_inner_split(
             y_inner_train_bin = (y_inner_train > 0).astype(int)
             y_inner_valid_bin = (y_inner_valid > 0).astype(int)
             if len(np.unique(y_inner_train_bin)) >= 2 and len(np.unique(y_inner_valid_bin)) >= 2:
-                clf_tuned = lgb.LGBMClassifier(**clf_params(clf_iters))
-                clf_tuned.fit(
-                    X_inner_train,
-                    y_inner_train_bin,
-                    eval_set=[(X_inner_valid, y_inner_valid_bin)],
-                    eval_metric="binary_logloss",
-                    callbacks=[lgb.early_stopping(100, verbose=False)],
-                )
-                clf_iters = int(getattr(clf_tuned, "best_iteration_", 0) or clf_iters)
+                clf_rounds = int(cfg.classifier_early_stopping_rounds)
+                if clf_rounds > 0:
+                    clf_tuned = lgb.LGBMClassifier(**clf_params(clf_iters))
+                    clf_tuned.fit(
+                        X_inner_train,
+                        y_inner_train_bin,
+                        eval_set=[(X_inner_valid, y_inner_valid_bin)],
+                        eval_metric="binary_logloss",
+                        callbacks=_early_stopping_callbacks(clf_rounds),
+                    )
+                    clf_iters = int(getattr(clf_tuned, "best_iteration_", 0) or clf_iters)
+                    metadata["classifier_early_stopping_status"] = "used"
+                else:
+                    metadata["classifier_early_stopping_status"] = "disabled"
+            else:
+                metadata["classifier_early_stopping_status"] = "skipped_single_class"
 
             pos_inner_train = y_inner_train > 0
             pos_inner_valid = y_inner_valid > 0
             if np.any(pos_inner_train):
-                reg_tuned = lgb.LGBMRegressor(**reg_params(reg_iters))
-                eval_x = (
-                    X_inner_valid.loc[pos_inner_valid] if np.any(pos_inner_valid) else X_inner_valid
-                )
-                eval_y = (
-                    y_inner_valid[pos_inner_valid] if np.any(pos_inner_valid) else y_inner_valid
-                )
-                reg_tuned.fit(
-                    X_inner_train.loc[pos_inner_train],
-                    y_inner_train[pos_inner_train],
-                    eval_set=[(eval_x, eval_y)],
-                    eval_metric="l1",
-                    callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)],
-                )
-                reg_iters = int(getattr(reg_tuned, "best_iteration_", 0) or reg_iters)
+                reg_rounds = _regressor_early_stopping_rounds(cfg)
+                if reg_rounds > 0:
+                    reg_tuned = lgb.LGBMRegressor(**reg_params(reg_iters))
+                    eval_x = (
+                        X_inner_valid.loc[pos_inner_valid]
+                        if np.any(pos_inner_valid)
+                        else X_inner_valid
+                    )
+                    eval_y = (
+                        y_inner_valid[pos_inner_valid] if np.any(pos_inner_valid) else y_inner_valid
+                    )
+                    reg_tuned.fit(
+                        X_inner_train.loc[pos_inner_train],
+                        y_inner_train[pos_inner_train],
+                        eval_set=[(eval_x, eval_y)],
+                        eval_metric="l1",
+                        callbacks=_early_stopping_callbacks(reg_rounds),
+                    )
+                    reg_iters = int(getattr(reg_tuned, "best_iteration_", 0) or reg_iters)
+                    metadata["regressor_early_stopping_status"] = "used"
+                else:
+                    metadata["regressor_early_stopping_status"] = "disabled"
+            else:
+                metadata["regressor_early_stopping_status"] = "skipped_no_positive_training_rows"
 
-            metadata["used_inner_early_stopping"] = True
+            metadata["used_inner_early_stopping"] = bool(
+                metadata["classifier_early_stopping_status"] == "used"
+                or metadata["regressor_early_stopping_status"] == "used"
+            )
+        else:
+            metadata["classifier_early_stopping_status"] = "skipped_no_inner_split"
+            metadata["regressor_early_stopping_status"] = "skipped_no_inner_split"
         metadata["chosen_classifier_iterations"] = int(clf_iters)
         metadata["chosen_regressor_iterations"] = int(reg_iters)
 
@@ -1132,18 +1182,27 @@ def _fit_lgbm_with_inner_split(
             reg_final.fit(X_full, y_full)
         return (clf_final, reg_final), metadata
 
-    reg_iters = int(cfg.n_estimators)
+    reg_iters = _regressor_n_estimators(cfg)
     if inner_available:
-        reg_tuned = lgb.LGBMRegressor(**reg_params(reg_iters))
-        reg_tuned.fit(
-            inner_train[feature_cols],
-            inner_train["sales"].to_numpy(dtype=np.float64),
-            eval_set=[(inner_valid[feature_cols], inner_valid["sales"].to_numpy(dtype=np.float64))],
-            eval_metric="l1",
-            callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)],
-        )
-        reg_iters = int(getattr(reg_tuned, "best_iteration_", 0) or reg_iters)
-        metadata["used_inner_early_stopping"] = True
+        reg_rounds = _regressor_early_stopping_rounds(cfg)
+        if reg_rounds > 0:
+            reg_tuned = lgb.LGBMRegressor(**reg_params(reg_iters))
+            reg_tuned.fit(
+                inner_train[feature_cols],
+                inner_train["sales"].to_numpy(dtype=np.float64),
+                eval_set=[
+                    (inner_valid[feature_cols], inner_valid["sales"].to_numpy(dtype=np.float64))
+                ],
+                eval_metric="l1",
+                callbacks=_early_stopping_callbacks(reg_rounds),
+            )
+            reg_iters = int(getattr(reg_tuned, "best_iteration_", 0) or reg_iters)
+            metadata["used_inner_early_stopping"] = True
+            metadata["regressor_early_stopping_status"] = "used"
+        else:
+            metadata["regressor_early_stopping_status"] = "disabled"
+    else:
+        metadata["regressor_early_stopping_status"] = "skipped_no_inner_split"
     metadata["chosen_regressor_iterations"] = int(reg_iters)
 
     reg_final = lgb.LGBMRegressor(**reg_params(reg_iters))
@@ -1322,176 +1381,7 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
     )
 
     # -----------------------------
-    # 5) Fit/eval helper (single split)
-    # -----------------------------
-    def _fit_and_eval(
-        train_df: pd.DataFrame, valid_df: pd.DataFrame
-    ) -> Tuple[Dict[str, Any], Any, np.ndarray]:
-        # Baselines
-        b1_s = valid_df["baseline_mean_28"]
-        b2_s = valid_df["baseline_seasonal_7"].fillna(b1_s)
-        b3_s = valid_df["baseline_seasonal_364"].fillna(b2_s)
-
-        yv = valid_df["sales"].to_numpy(dtype=np.float64)
-        b1 = b1_s.to_numpy(dtype=np.float64)
-        b2 = b2_s.to_numpy(dtype=np.float64)
-        b3 = b3_s.to_numpy(dtype=np.float64)
-
-        mae_b1 = _mae(yv, b1)
-        mae_b2 = _mae(yv, b2)
-        mae_b3 = _mae(yv, b3)
-
-        wmape_b1 = _wmape(yv, b1)
-        wmape_b2 = _wmape(yv, b2)
-        wmape_b3 = _wmape(yv, b3)
-
-        smape_nz_b1 = _smape_nonzero(yv, b1)
-        smape_nz_b2 = _smape_nonzero(yv, b2)
-        smape_nz_b3 = _smape_nonzero(yv, b3)
-
-        X_train = train_df[feature_cols]
-        y_train = train_df["sales"].to_numpy(dtype=np.float64)
-        X_valid = valid_df[feature_cols]
-        y_valid = valid_df["sales"].to_numpy(dtype=np.float64)
-
-        # Model metrics (two-stage adds classifier metrics)
-        nonzero_auc: float = float("nan")
-        nonzero_logloss: float = float("nan")
-
-        if cfg.two_stage:
-            # A) classifier
-            y_train_bin = (y_train > 0).astype(int)
-            y_valid_bin = (y_valid > 0).astype(int)
-
-            clf_params = dict(
-                objective="binary",
-                n_estimators=2000,
-                learning_rate=0.05,
-                num_leaves=128,
-                min_child_samples=cfg.min_data_in_leaf,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_lambda=1.0,
-                random_state=cfg.random_state,
-                n_jobs=-1,
-            )
-            clf = lgb.LGBMClassifier(**clf_params)
-            clf.fit(
-                X_train,
-                y_train_bin,
-                eval_set=[(X_valid, y_valid_bin)],
-                eval_metric="binary_logloss",
-                callbacks=[lgb.early_stopping(100, verbose=False)],
-            )
-
-            # B) regressor on positives
-            pos_tr = y_train > 0
-            pos_va = y_valid > 0
-
-            X_train_pos = X_train.loc[pos_tr]
-            y_train_pos = y_train[pos_tr]
-
-            X_valid_pos = X_valid.loc[pos_va] if np.any(pos_va) else X_train_pos
-            y_valid_pos = y_valid[pos_va] if np.any(pos_va) else y_train_pos
-
-            reg_params = dict(
-                objective=cfg.objective,
-                n_estimators=cfg.n_estimators,
-                learning_rate=cfg.learning_rate,
-                num_leaves=cfg.num_leaves,
-                min_child_samples=cfg.min_data_in_leaf,
-                subsample=cfg.subsample,
-                colsample_bytree=cfg.colsample_bytree,
-                reg_lambda=cfg.reg_lambda,
-                random_state=cfg.random_state,
-                n_jobs=-1,
-            )
-            if cfg.objective == "tweedie":
-                reg_params["tweedie_variance_power"] = cfg.tweedie_variance_power
-
-            reg = lgb.LGBMRegressor(**reg_params)
-            reg.fit(
-                X_train_pos,
-                y_train_pos,
-                eval_set=[(X_valid_pos, y_valid_pos)],
-                eval_metric="l1",
-                callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)],
-            )
-
-            p_valid = clf.predict_proba(X_valid)[:, 1].astype(np.float64)
-            q_valid = np.clip(reg.predict(X_valid).astype(np.float64), 0, None)
-            pred_valid = np.clip(p_valid * q_valid, 0, None)
-
-            nonzero_auc = _roc_auc_tie_correct(y_valid_bin, p_valid)
-            nonzero_logloss = _binary_logloss(y_valid_bin, p_valid)
-
-            model_obj: Any = (clf, reg)
-
-        else:
-            params = dict(
-                objective=cfg.objective,
-                n_estimators=cfg.n_estimators,
-                learning_rate=cfg.learning_rate,
-                num_leaves=cfg.num_leaves,
-                min_child_samples=cfg.min_data_in_leaf,
-                subsample=cfg.subsample,
-                colsample_bytree=cfg.colsample_bytree,
-                reg_lambda=cfg.reg_lambda,
-                random_state=cfg.random_state,
-                n_jobs=-1,
-            )
-            if cfg.objective == "tweedie":
-                params["tweedie_variance_power"] = cfg.tweedie_variance_power
-
-            reg = lgb.LGBMRegressor(**params)
-            reg.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_valid, y_valid)],
-                eval_metric="l1",
-                callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)],
-            )
-            pred_valid = np.clip(reg.predict(X_valid).astype(np.float64), 0, None)
-            model_obj = reg
-
-        mae_lgbm = _mae(yv, pred_valid)
-        wmape_lgbm = _wmape(yv, pred_valid)
-        smape_lgbm = _smape(yv, pred_valid)
-        smape_nonzero_lgbm = _smape_nonzero(yv, pred_valid)
-
-        metrics = {
-            # Baselines
-            "mae_baseline_mean_28": float(mae_b1),
-            "mae_baseline_seas_7": float(mae_b2),
-            "mae_baseline_seas_364": float(mae_b3),
-            "wmape_baseline_mean_28": float(wmape_b1),
-            "wmape_baseline_seas_7": float(wmape_b2),
-            "wmape_baseline_seas_364": float(wmape_b3),
-            "smape_nonzero_baseline_mean_28": (
-                float(smape_nz_b1) if np.isfinite(smape_nz_b1) else float("nan")
-            ),
-            "smape_nonzero_baseline_seas_7": (
-                float(smape_nz_b2) if np.isfinite(smape_nz_b2) else float("nan")
-            ),
-            "smape_nonzero_baseline_seas_364": (
-                float(smape_nz_b3) if np.isfinite(smape_nz_b3) else float("nan")
-            ),
-            # Model
-            "mae_lgbm": float(mae_lgbm),
-            "wmape_lgbm": float(wmape_lgbm),
-            "smape_lgbm": float(smape_lgbm),
-            "smape_nonzero_lgbm": (
-                float(smape_nonzero_lgbm) if np.isfinite(smape_nonzero_lgbm) else float("nan")
-            ),
-            "nonzero_auc": float(nonzero_auc) if np.isfinite(nonzero_auc) else float("nan"),
-            "nonzero_logloss": (
-                float(nonzero_logloss) if np.isfinite(nonzero_logloss) else float("nan")
-            ),
-        }
-        return metrics, model_obj, pred_valid
-
-    # -----------------------------
-    # 6) Rolling-origin backtests (multiple cutoffs)
+    # 5) Rolling-origin backtests (multiple cutoffs)
     # -----------------------------
     backtests: List[Dict[str, Any]] = []
     model_latest: Any = None
@@ -1537,54 +1427,6 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
                 "wmape_baseline_seas_364": float(bt["wmape_baseline_seasonal_364"]),
             }
 
-    for j, (tr_end, va_start, va_end) in enumerate([]):
-        train_df = usable.loc[usable["d"] <= tr_end].copy()
-        valid_df = usable.loc[(usable["d"] >= va_start) & (usable["d"] <= va_end)].copy()
-        if train_df.empty or valid_df.empty:
-            continue
-
-        m_split, model_obj, pred_valid = _fit_and_eval(train_df, valid_df)
-
-        # segment metrics (events, price drops) on this split
-        valid_df2 = valid_df.copy()
-        valid_df2["_pred"] = pred_valid
-        seg = add_segment_metrics(valid_df2, y_col="sales", yhat_col="_pred")
-
-        # Confidence interval calibration (residual quantiles) only for the latest split
-        resid_q = {}
-        if j == 0:
-            resid = (valid_df2["sales"].to_numpy(dtype=np.float64) - pred_valid).astype(np.float64)
-            resid_q = {
-                "residual_q10": float(np.quantile(resid, 0.10)),
-                "residual_q50": float(np.quantile(resid, 0.50)),
-                "residual_q90": float(np.quantile(resid, 0.90)),
-            }
-            # Segment residual quantiles (more honest than one global band)
-            if ("event_name_1" in valid_df2.columns) and ("event_name_2" in valid_df2.columns):
-                is_event = valid_df2["event_name_1"].notna() | valid_df2["event_name_2"].notna()
-                for nm, mask in [("event", is_event), ("non_event", ~is_event)]:
-                    rr = resid[mask.to_numpy()] if mask.any() else np.array([], dtype=float)
-                    if rr.size:
-                        resid_q[f"residual_q10_{nm}"] = float(np.quantile(rr, 0.10))
-                        resid_q[f"residual_q50_{nm}"] = float(np.quantile(rr, 0.50))
-                        resid_q[f"residual_q90_{nm}"] = float(np.quantile(rr, 0.90))
-
-        bt = {
-            "split": {"train_end_d": tr_end, "valid_start_d": va_start, "valid_end_d": va_end},
-            **m_split,
-            **seg,
-            **resid_q,
-            "train_rows": int(len(train_df)),
-            "valid_rows": int(len(valid_df)),
-        }
-        backtests.append(bt)
-
-        if j == 0:
-            model_latest = model_obj
-            pred_latest = pred_valid
-            valid_latest = valid_df2
-            metrics_latest = m_split
-
     if not backtests or metrics_latest is None or valid_latest is None or pred_latest is None:
         raise RuntimeError(
             "Backtesting produced no valid splits; check start_d/last_train_d and horizon."
@@ -1599,15 +1441,15 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
         metrics_latest["wmape_baseline_seas_364"],
     )
     wmape_lgbm = float(metrics_latest["wmape_lgbm"])
-    winner = "lgbm" if wmape_lgbm <= best_baseline_wmape else "baseline"
+    latest_split_winner = "lgbm" if wmape_lgbm <= best_baseline_wmape else "baseline"
 
     logger.info(
-        "Latest split (%s→%s): best_baseline_wmape=%.4f, lgbm_wmape=%.4f => winner=%s",
+        "Latest split (%s→%s): best_baseline_wmape=%.4f, lgbm_wmape=%.4f => latest_split_winner=%s",
         train_end_d,
         valid_end_d,
         float(best_baseline_wmape),
         float(wmape_lgbm),
-        winner,
+        latest_split_winner,
     )
 
     promotion = evaluate_promotion_policy(
@@ -1667,7 +1509,10 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
                 reg_params["n_estimators"] = best_reg
             reg_f = lgb.LGBMRegressor(**reg_params)
             pos = y_full > 0
-            reg_f.fit(X_full.loc[pos], y_full[pos])
+            if np.any(pos):
+                reg_f.fit(X_full.loc[pos], y_full[pos])
+            else:
+                reg_f.fit(X_full, y_full)
 
             model_for_serving = (clf_f, reg_f)
         else:
@@ -1703,123 +1548,21 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
     preds = []
     for day in dates:
         day_rows = fut2.loc[fut2["date"] == day].copy()
-        rows = []
-
-        for r in day_rows.itertuples(index=False):
-            _id = r.id
-            sh = hist_sales[_id]
-            ph = hist_price[_id]
-
-            def lag(L: int):
-                return sh[-L] if len(sh) >= L else np.nan
-
-            def roll_mean(W: int):
-                x = sh[-W:] if len(sh) >= W else sh
-                return float(np.mean(x)) if len(x) else np.nan
-
-            def roll_std(W: int):
-                x = sh[-W:] if len(sh) >= W else sh
-                return float(np.std(x, ddof=0)) if len(x) > 1 else 0.0
-
-            def roll_sum(W: int):
-                x = sh[-W:] if len(sh) >= W else sh
-                return float(np.sum(x)) if len(x) else np.nan
-
-            def days_since_last_sale():
-                for i2 in range(1, len(sh) + 1):
-                    if sh[-i2] > 0:
-                        return float(i2)
-                return 9999.0
-
-            base_pred = _baseline_prediction_from_history(sh, selected_baseline)
-
-            # price
-            price = float(r.sell_price) if pd.notna(r.sell_price) else (ph[-1] if ph else np.nan)
-            price_lag_1 = ph[-1] if ph else np.nan
-            observed_prices = [float(v) for v in ph[-28:] if np.isfinite(float(v))]
-            price_roll_mean_28 = float(np.mean(observed_prices)) if observed_prices else np.nan
-            price_rel_28 = (
-                (price / (price_roll_mean_28 + 1e-6) - 1.0)
-                if pd.notna(price) and pd.notna(price_roll_mean_28)
-                else np.nan
+        X_day = pd.DataFrame(
+            _recursive_feature_rows(
+                day_rows,
+                hist_sales=hist_sales,
+                hist_price=hist_price,
+                cfg=cfg,
+                origin_date=origin_date,
+                cat_cols=cat_cols,
             )
-            price_pct_change_1 = (
-                (price / (price_lag_1 + 1e-6) - 1.0)
-                if pd.notna(price) and pd.notna(price_lag_1)
-                else np.nan
-            )
-            price_changed_today = (
-                pd.notna(price) and pd.notna(price_lag_1) and not np.isclose(price, price_lag_1)
-            )
-            price_was_missing = 0 if pd.notna(r.sell_price) else 1
-
-            # count price changes over last 28 days (includes today)
-            all_prices = [v for v in (ph[-27:] if len(ph) >= 27 else ph) if np.isfinite(float(v))]
-            if np.isfinite(price):
-                all_prices.append(price)
-            price_change_count_28 = 0.0
-            if len(all_prices) >= 2:
-                price_change_count_28 = float(
-                    sum(
-                        1
-                        for j in range(1, len(all_prices))
-                        if not np.isclose(all_prices[j], all_prices[j - 1])
-                    )
-                )
-
-            # weeks since last price change
-            days_since_change = 9999.0
-            if len(ph) >= 1:
-                hp = [v for v in ph if np.isfinite(float(v))]
-                if np.isfinite(price):
-                    hp.append(price)
-                last_change_idx = None
-                for j in range(len(hp) - 1, 0, -1):
-                    if not np.isclose(hp[j], hp[j - 1]):
-                        last_change_idx = j
-                        break
-                if last_change_idx is not None:
-                    days_since_change = float((len(hp) - 1) - last_change_idx)
-            weeks_since_price_change = float(days_since_change / 7.0)
-
-            # intermittency
-            def nonzero_rate(W: int):
-                x = sh[-W:] if len(sh) >= W else sh
-                return float(np.mean([1.0 if v > 0 else 0.0 for v in x])) if len(x) else 0.0
-
-            row = {
-                "id": _id,
-                "sell_price": price,
-                "price_lag_1": price_lag_1,
-                "price_roll_mean_28": price_roll_mean_28,
-                "price_rel_28": price_rel_28,
-                "price_pct_change_1": price_pct_change_1,
-                "price_changed_today": float(price_changed_today),
-                "price_change_count_28": price_change_count_28,
-                "weeks_since_price_change": weeks_since_price_change,
-                "price_was_missing": int(price_was_missing),
-                "t": int((day - origin_date).days),
-                "days_since_last_sale": days_since_last_sale(),
-                "snap": int(r.snap),
-                "wday": int(r.wday),
-                "month": int(r.month),
-                "year": int(r.year),
-                "_baseline": base_pred,
-                "_baseline_family": selected_baseline,
-            }
-            for L in cfg.lags:
-                row[f"lag_{L}"] = lag(L)
-            for W in cfg.rolls:
-                row[f"roll_mean_{W}"] = roll_mean(W)
-                row[f"roll_std_{W}"] = roll_std(W)
-                row[f"roll_sum_{W}"] = roll_sum(W)
-            for W in cfg.nonzero_rolls:
-                row[f"nonzero_rate_{W}"] = nonzero_rate(W)
-            for c in cat_cols:
-                row[c] = getattr(r, c)
-            rows.append(row)
-
-        X_day = pd.DataFrame(rows)
+        )
+        X_day["_baseline"] = [
+            _baseline_prediction_from_history(hist_sales[str(_id)], selected_baseline)
+            for _id in X_day["id"].astype(str)
+        ]
+        X_day["_baseline_family"] = selected_baseline
         for c in cat_cols:
             X_day[c] = pd.Categorical(X_day[c].astype(str), categories=long2[c].cat.categories)
 

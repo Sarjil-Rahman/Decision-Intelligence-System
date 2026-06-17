@@ -234,7 +234,9 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
     result = build_warehouse(**kwargs)
 
     with duckdb.connect(str(db)) as con:
-        counts = dict(con.execute("""
+        counts = dict(
+            con.execute(
+                """
                 SELECT 'dim_date' AS table_name, COUNT(*) AS rows FROM dim_date
                 UNION ALL
                 SELECT 'dim_item', COUNT(*) FROM dim_item
@@ -246,8 +248,13 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
                 SELECT 'fact_daily_sales', COUNT(*) FROM fact_daily_sales WHERE run_id = 'demo'
                 UNION ALL
                 SELECT 'fact_retail_daily_kpis', COUNT(*) FROM fact_retail_daily_kpis WHERE run_id = 'demo'
-                """).fetchall())
-        views = {row[0] for row in con.execute("""
+                """
+            ).fetchall()
+        )
+        views = {
+            row[0]
+            for row in con.execute(
+                """
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema = 'main'
@@ -257,7 +264,9 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
                     'mart_category_finance_kpis',
                     'mart_execution_readiness'
                   )
-                """).fetchall()}
+                """
+            ).fetchall()
+        }
 
     assert counts["dim_date"] == 5
     assert counts["dim_item"] == 2

@@ -26,7 +26,22 @@ def get_logger(name: str = "pipeline") -> logging.Logger:
 
 
 def require_files(data_dir: str, files: Iterable[str]) -> None:
-    missing = [f for f in files if not os.path.exists(os.path.join(data_dir, f))]
+    root = Path(data_dir).resolve()
+    missing = []
+    escaped = []
+    for f in files:
+        candidate = (root / f).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            escaped.append(str(f))
+            continue
+        if not candidate.is_file():
+            missing.append(str(f))
+    if escaped:
+        raise ValueError(
+            f"Required file(s) in '{data_dir}' resolve outside the dataset: " + ", ".join(escaped)
+        )
     if missing:
         raise FileNotFoundError(f"Missing required file(s) in '{data_dir}': " + ", ".join(missing))
 

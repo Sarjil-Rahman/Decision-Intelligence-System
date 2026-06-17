@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import duckdb
 import pandas as pd
@@ -74,6 +75,10 @@ def test_build_warehouse_without_business_pack(tmp_path: Path) -> None:
     )
 
     assert result["fact_daily_sales_rows"] == 10
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "test_run"
+    assert manifest["row_counts"]["fact_daily_sales"] == 10
+    assert manifest["warnings"]
     with duckdb.connect(str(db)) as con:
         tables = {
             row[0]
@@ -118,17 +123,92 @@ def test_build_warehouse_loads_business_pack_when_present(tmp_path: Path) -> Non
             "latest_best_baseline_wmape": [0.3, 0.3],
         }
     ).to_csv(dashboard_dir / "fact_scenario_comparison.csv", index=False)
+    pd.DataFrame(
+        {
+            "id": ["x1", "x2"],
+            "store_id": ["CA_1", "TX_1"],
+            "item_id": ["FOODS_1_001", "HOBBIES_1_001"],
+            "price": [2.0, 5.0],
+            "best_price": [1.8, 4.5],
+            "base_demand_28d": [10.0, 20.0],
+            "elasticity": [-1.5, -2.0],
+            "base_profit": [10.0, 20.0],
+            "best_profit": [11.0, 22.0],
+            "profit_gain": [1.0, 2.0],
+        }
+    ).to_csv(data_dir / "price_optimization_results.csv", index=False)
+    pd.DataFrame(
+        {
+            "id": ["x1", "x1", "x2", "x2"],
+            "action_id": ["x1::a", "x1::b", "x2::a", "x2::b"],
+            "store_id": ["CA_1", "CA_1", "TX_1", "TX_1"],
+            "item_id": ["FOODS_1_001", "FOODS_1_001", "HOBBIES_1_001", "HOBBIES_1_001"],
+            "cat_id": ["FOODS", "FOODS", "HOBBIES", "HOBBIES"],
+            "price": [2.0, 2.0, 5.0, 5.0],
+            "new_price": [1.8, 1.9, 4.5, 4.75],
+            "base_demand_28d": [10.0, 10.0, 20.0, 20.0],
+            "new_demand": [11.0, 10.5, 21.0, 20.5],
+            "base_revenue": [20.0, 20.0, 100.0, 100.0],
+            "new_revenue": [19.8, 19.95, 94.5, 97.375],
+            "base_profit": [10.0, 10.0, 20.0, 20.0],
+            "new_profit": [11.0, 10.5, 22.0, 21.0],
+            "profit_gain": [1.0, 0.5, 2.0, 1.0],
+            "demand_gain": [1.0, 0.5, 1.0, 0.5],
+            "chosen_delta": [-0.1, -0.05, -0.1, -0.05],
+            "promo_spend_proxy": [2.2, 1.05, 10.5, 5.125],
+            "eligible": [1, 1, 1, 1],
+            "selected": [1, 0, 0, 0],
+            "is_change": [1, 1, 1, 1],
+        }
+    ).to_csv(data_dir / "promo_action_candidates.csv", index=False)
+    pd.DataFrame(
+        {
+            "id": ["x1", "x2"],
+            "action_id": ["x1::a", "x2::no_action"],
+            "store_id": ["CA_1", "TX_1"],
+            "item_id": ["FOODS_1_001", "HOBBIES_1_001"],
+            "cat_id": ["FOODS", "HOBBIES"],
+            "price": [2.0, 5.0],
+            "applied_price": [1.8, 5.0],
+            "base_demand_28d": [10.0, 20.0],
+            "applied_demand": [11.0, 20.0],
+            "base_revenue": [20.0, 100.0],
+            "applied_revenue": [19.8, 100.0],
+            "base_profit": [10.0, 20.0],
+            "applied_profit": [11.0, 20.0],
+            "profit_gain": [1.0, 0.0],
+            "demand_gain": [1.0, 0.0],
+            "chosen_delta": [-0.1, 0.0],
+            "promo_spend_proxy": [2.2, 0.0],
+            "selected": [1, 0],
+            "eligible": [1, 1],
+            "applied_is_change": [1, 0],
+            "constraint_violation": [0, 0],
+        }
+    ).to_csv(data_dir / "promo_selection_results.csv", index=False)
 
     db = tmp_path / "analytics.duckdb"
-    build_warehouse(data_dir=data_dir, reports_dir=data_dir / "reports", db=db, run_id="bp_run")
+    result = build_warehouse(
+        data_dir=data_dir, reports_dir=data_dir / "reports", db=db, run_id="bp_run"
+    )
     with duckdb.connect(str(db)) as con:
         rows = con.execute(
             "SELECT COUNT(*) FROM fact_scenario_comparison WHERE run_id = 'bp_run'"
+        ).fetchone()[0]
+        candidate_rows = con.execute(
+            "SELECT COUNT(*) FROM fact_promo_action_candidates WHERE run_id = 'bp_run'"
+        ).fetchone()[0]
+        decision_rows = con.execute(
+            "SELECT COUNT(*) FROM fact_promo_item_decisions WHERE run_id = 'bp_run'"
         ).fetchone()[0]
         uplift = con.execute(
             "SELECT uplift_gbp FROM mart_executive_finance_kpis WHERE run_id = 'bp_run'"
         ).fetchone()[0]
     assert rows == 2
+    assert candidate_rows == 4
+    assert decision_rows == 2
+    assert result["manifest"]["row_counts"]["fact_promo_action_candidates"] == 4
+    assert result["manifest"]["row_counts"]["fact_promo_item_decisions"] == 2
     assert uplift == 20.0
 
 
@@ -151,10 +231,12 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
     }
 
     build_warehouse(**kwargs)
-    build_warehouse(**kwargs)
+    result = build_warehouse(**kwargs)
 
     with duckdb.connect(str(db)) as con:
-        counts = dict(con.execute("""
+        counts = dict(
+            con.execute(
+                """
                 SELECT 'dim_date' AS table_name, COUNT(*) AS rows FROM dim_date
                 UNION ALL
                 SELECT 'dim_item', COUNT(*) FROM dim_item
@@ -166,8 +248,13 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
                 SELECT 'fact_daily_sales', COUNT(*) FROM fact_daily_sales WHERE run_id = 'demo'
                 UNION ALL
                 SELECT 'fact_retail_daily_kpis', COUNT(*) FROM fact_retail_daily_kpis WHERE run_id = 'demo'
-                """).fetchall())
-        views = {row[0] for row in con.execute("""
+                """
+            ).fetchall()
+        )
+        views = {
+            row[0]
+            for row in con.execute(
+                """
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema = 'main'
@@ -177,7 +264,9 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
                     'mart_category_finance_kpis',
                     'mart_execution_readiness'
                   )
-                """).fetchall()}
+                """
+            ).fetchall()
+        }
 
     assert counts["dim_date"] == 5
     assert counts["dim_item"] == 2
@@ -185,6 +274,7 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
     assert counts["dim_product_store"] == 2
     assert counts["fact_daily_sales"] == 10
     assert counts["fact_retail_daily_kpis"] == 10
+    assert result["manifest"]["idempotency_policy"].startswith("same run_id")
     assert {
         "mart_executive_finance_kpis",
         "mart_store_finance_kpis",

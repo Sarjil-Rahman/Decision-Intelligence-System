@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import duckdb
 import pandas as pd
@@ -30,7 +30,7 @@ def main():
 
     reports = Path(args.reports_dir)
     dashboard_dir = reports / "dashboard_ready"
-    run_id = args.run_id or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     price_actions_csv = (
         Path(args.price_actions_csv) if args.price_actions_csv else (reports / "price_actions.csv")
@@ -58,7 +58,7 @@ def main():
     con.execute(schema_path.read_text(encoding="utf-8"))
     con.execute(
         "INSERT OR REPLACE INTO runs VALUES (?, ?, ?)",
-        [run_id, datetime.utcnow(), f"Loaded from {reports}"],
+        [run_id, datetime.now(timezone.utc), f"Loaded from {reports}"],
     )
 
     if price_actions_csv.exists():
@@ -103,6 +103,71 @@ def main():
         ].copy()
         df2.insert(0, "run_id", run_id)
         _insert_df(con, "fact_price_actions", df2)
+
+    promo_candidates_csv = reports.parent / "promo_action_candidates.csv"
+    if promo_candidates_csv.exists():
+        df = pd.read_csv(promo_candidates_csv)
+        keep_cols = [
+            "id",
+            "action_id",
+            "store_id",
+            "item_id",
+            "cat_id",
+            "price",
+            "new_price",
+            "base_demand_28d",
+            "new_demand",
+            "base_revenue",
+            "new_revenue",
+            "base_profit",
+            "new_profit",
+            "profit_gain",
+            "demand_gain",
+            "chosen_delta",
+            "promo_spend_proxy",
+            "eligible",
+            "selected",
+            "is_change",
+        ]
+        for c in keep_cols:
+            if c not in df.columns:
+                df[c] = None
+        df2 = df[keep_cols].copy()
+        df2.insert(0, "run_id", run_id)
+        _insert_df(con, "fact_promo_action_candidates", df2)
+
+    promo_decisions_csv = reports.parent / "promo_selection_results.csv"
+    if promo_decisions_csv.exists():
+        df = pd.read_csv(promo_decisions_csv)
+        keep_cols = [
+            "id",
+            "action_id",
+            "store_id",
+            "item_id",
+            "cat_id",
+            "price",
+            "applied_price",
+            "base_demand_28d",
+            "applied_demand",
+            "base_revenue",
+            "applied_revenue",
+            "base_profit",
+            "applied_profit",
+            "profit_gain",
+            "demand_gain",
+            "chosen_delta",
+            "promo_spend_proxy",
+            "selected",
+            "eligible",
+            "applied_is_change",
+            "constraint_violation",
+        ]
+        for c in keep_cols:
+            if c not in df.columns:
+                df[c] = None
+        df2 = df[keep_cols].copy()
+        df2.insert(0, "run_id", run_id)
+        _insert_df(con, "fact_promo_item_decisions", df2)
 
     if uplift_store_csv.exists():
         df = pd.read_csv(uplift_store_csv)

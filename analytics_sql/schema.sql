@@ -95,6 +95,55 @@ CREATE TABLE IF NOT EXISTS fact_price_actions (
   uplift_profit DOUBLE
 );
 
+CREATE TABLE IF NOT EXISTS fact_promo_action_candidates (
+  run_id TEXT,
+  id TEXT,
+  action_id TEXT,
+  store_id TEXT,
+  item_id TEXT,
+  cat_id TEXT,
+  price DOUBLE,
+  new_price DOUBLE,
+  base_demand_28d DOUBLE,
+  new_demand DOUBLE,
+  base_revenue DOUBLE,
+  new_revenue DOUBLE,
+  base_profit DOUBLE,
+  new_profit DOUBLE,
+  profit_gain DOUBLE,
+  demand_gain DOUBLE,
+  chosen_delta DOUBLE,
+  promo_spend_proxy DOUBLE,
+  eligible BIGINT,
+  selected BIGINT,
+  is_change BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS fact_promo_item_decisions (
+  run_id TEXT,
+  id TEXT,
+  action_id TEXT,
+  store_id TEXT,
+  item_id TEXT,
+  cat_id TEXT,
+  price DOUBLE,
+  applied_price DOUBLE,
+  base_demand_28d DOUBLE,
+  applied_demand DOUBLE,
+  base_revenue DOUBLE,
+  applied_revenue DOUBLE,
+  base_profit DOUBLE,
+  applied_profit DOUBLE,
+  profit_gain DOUBLE,
+  demand_gain DOUBLE,
+  chosen_delta DOUBLE,
+  promo_spend_proxy DOUBLE,
+  selected BIGINT,
+  eligible BIGINT,
+  applied_is_change BIGINT,
+  constraint_violation BIGINT
+);
+
 CREATE TABLE IF NOT EXISTS agg_uplift_by_store (
   run_id TEXT,
   store_id TEXT,

@@ -31,12 +31,15 @@ class ForecastResponse(BaseModel):
     winner: str
     backtests: List[Dict[str, Any]]
 
-    # Convenience: latest residual quantiles for confidence intervals
+    # Deprecated compatibility fields; use prediction_intervals from artifacts/responses.
     residual_q10: float
     residual_q50: float
     residual_q90: float
 
     artifacts: Dict[str, Any]
+    selected_baseline: Optional[str] = None
+    promotion: Dict[str, Any] = Field(default_factory=dict)
+    prediction_intervals: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PriceActionsRequest(BaseModel):

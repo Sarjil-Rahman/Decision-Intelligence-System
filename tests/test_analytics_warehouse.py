@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import duckdb
 import pandas as pd
@@ -74,6 +75,10 @@ def test_build_warehouse_without_business_pack(tmp_path: Path) -> None:
     )
 
     assert result["fact_daily_sales_rows"] == 10
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "test_run"
+    assert manifest["row_counts"]["fact_daily_sales"] == 10
+    assert manifest["warnings"]
     with duckdb.connect(str(db)) as con:
         tables = {
             row[0]
@@ -151,7 +156,7 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
     }
 
     build_warehouse(**kwargs)
-    build_warehouse(**kwargs)
+    result = build_warehouse(**kwargs)
 
     with duckdb.connect(str(db)) as con:
         counts = dict(con.execute("""
@@ -185,6 +190,7 @@ def test_build_warehouse_is_idempotent_for_same_run_id(tmp_path: Path) -> None:
     assert counts["dim_product_store"] == 2
     assert counts["fact_daily_sales"] == 10
     assert counts["fact_retail_daily_kpis"] == 10
+    assert result["manifest"]["idempotency_policy"].startswith("same run_id")
     assert {
         "mart_executive_finance_kpis",
         "mart_store_finance_kpis",

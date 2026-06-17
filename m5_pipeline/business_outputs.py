@@ -130,8 +130,18 @@ def _float(v: Any) -> float:
         return float("nan")
     try:
         return float(v)
-    except Exception:
+    except (TypeError, ValueError):
         return float("nan")
+
+
+def _best_baseline_wmape(latest: Dict[str, Any]) -> float:
+    vals = [
+        _float(latest.get("wmape_baseline_mean_28")),
+        _float(latest.get("wmape_baseline_seas_7", latest.get("wmape_baseline_seasonal_7"))),
+        _float(latest.get("wmape_baseline_seas_364", latest.get("wmape_baseline_seasonal_364"))),
+    ]
+    finite = [v for v in vals if np.isfinite(v)]
+    return min(finite) if finite else float("nan")
 
 
 def build_reason_coded_actions(
@@ -381,11 +391,7 @@ def build_scenario_comparison(
     latest = backtests[0] if backtests else {}
     best_baseline_wmape = np.nan
     if latest:
-        best_baseline_wmape = min(
-            _float(latest.get("wmape_baseline_mean_28")),
-            _float(latest.get("wmape_baseline_seas_7")),
-            _float(latest.get("wmape_baseline_seas_364")),
-        )
+        best_baseline_wmape = _best_baseline_wmape(latest)
 
     rows = [
         {
@@ -529,11 +535,7 @@ def build_executive_kpi_summary(
     latest = backtests[0] if backtests else {}
     best_baseline_wmape = np.nan
     if latest:
-        best_baseline_wmape = min(
-            _float(latest.get("wmape_baseline_mean_28")),
-            _float(latest.get("wmape_baseline_seas_7")),
-            _float(latest.get("wmape_baseline_seas_364")),
-        )
+        best_baseline_wmape = _best_baseline_wmape(latest)
     model_wmape = _float(latest.get("wmape_lgbm"))
     forecast_winner = "baseline" if latest and model_wmape > best_baseline_wmape else "lgbm"
     model_uplift = (
@@ -856,6 +858,9 @@ def _write_dashboard_mockup(
     path: str | Path, executive: Dict[str, Any], scenario_df: pd.DataFrame, reason_mix: pd.DataFrame
 ) -> Optional[str]:
     try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
 
         p = Path(path)

@@ -10,6 +10,20 @@
 
 A production-minded retail decision intelligence system that connects **demand forecasting**, **price optimisation**, **promo selection**, **business reporting**, **dashboard-ready tables**, and **API / monitoring layers** into one coherent workflow.
 
+## Current Production-Hardening Status
+
+This version is intentionally conservative about claims:
+
+* Forecast evaluation uses nested chronological fitting and recursive outer backtests; the outer validation window is not used for early stopping.
+* Model promotion is gated across generated backtests. A deployable baseline can win, and that is a valid serving outcome.
+* Forecast bands are split-conformal prediction intervals with explicit coverage status, not confidence intervals.
+* Pricing uplift is observational and scenario-based until validated with a randomized experiment.
+* Public batch work is asynchronous through `/v1/jobs/*` and uses `dataset_id`; public requests do not accept arbitrary server filesystem paths.
+* CLI/local trusted workflows still accept `--data-dir`.
+* Promo selection is formulated as item-action MILP variables with at most one action per item.
+* The DuckDB warehouse is generated locally with a manifest; no generated database is bundled as evidence.
+* A constrained result with zero selected actions is valid when no candidate clears the rules.
+
 This repository is built to show the kind of ownership employers look for in **Data Scientist**, **ML Engineer**, **Applied AI Engineer**, **Decision Scientist**, and **Analytics Engineer** candidates:
 
 * turning raw retail data into a usable decision workflow
@@ -90,7 +104,7 @@ Builds a forecasting pipeline on M5-style retail data using a production-minded 
 * leak-safe feature generation
 * baseline comparison
 * last-window and rolling-origin validation
-* residual quantiles for uncertainty-style reporting
+* split-conformal prediction intervals with explicit coverage status
 
 ### 2) Generate price actions
 
@@ -99,7 +113,7 @@ Uses forecast outputs and price / economic assumptions to estimate directional p
 * elasticity estimation
 * fallback elasticity handling
 * guardrails on price changes and demand expansion
-* suspicious-uplift flags
+* suspicious scenario-uplift flags
 * commercial summary outputs
 
 ### 3) Build a constrained promo / price plan
@@ -130,13 +144,14 @@ The repo includes a local DuckDB analytics warehouse case study for retail decis
 
 Start here: [docs/sql_analytics_case_study.md](docs/sql_analytics_case_study.md)
 
-Small local build:
+Small local build after producing pipeline outputs:
 
 ```bash
 python analytics_sql/build_warehouse.py --data-dir data --reports-dir data/reports --db analytics.duckdb --run-id demo --max-series 100 --start-d d_1 --end-d d_90
 ```
 
 Finance KPIs in this layer are clearly labelled as proxy metrics because M5 does not provide real COGS, inventory, or audited financial data.
+The build writes a `*_manifest.json` file with source artefacts, row counts, marts/views, warnings, and the idempotency policy for rebuilding the same `run_id`.
 
 ---
 
@@ -146,7 +161,7 @@ Finance KPIs in this layer are clearly labelled as proxy metrics because M5 does
 flowchart LR
     A["Raw retail data<br/>calendar.csv<br/>sell_prices.csv<br/>sales_train_validation.csv"] --> B["Input validation<br/>and quality checks"]
     B --> C["Forecasting pipeline<br/>LightGBM + baselines + backtests"]
-    C --> D["Forecast outputs<br/>submission + metrics + quantiles"]
+    C --> D["Forecast outputs<br/>submission + metrics + prediction intervals"]
     D --> E["Price optimisation<br/>with elasticity + guardrails"]
     E --> F["Promo / constrained selection"]
     C --> G["Business reporting pack"]
@@ -162,7 +177,7 @@ flowchart LR
     E --> N
     F --> N
     G --> N
-    N --> O["Prometheus / Grafana monitoring"]
+    N --> O["Redis + Celery worker<br/>Prometheus / Grafana monitoring"]
 ```
 
 ---
@@ -239,17 +254,19 @@ pip install -r requirements-dev.txt
 copy .env.example .env
 ```
 
-### Run the API
+### Run the API and worker
 
 ```bat
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+For public batch jobs, run Redis and a Celery worker as in `docker-compose.yml`.
+
 Open:
 
 * Swagger docs: `http://localhost:8000/docs`
 * Health: `http://localhost:8000/health`
-* Metrics: `http://localhost:8000/metrics`
+* Metrics: `http://localhost:8000/metrics` (protect or isolate this endpoint in production)
 
 ---
 
@@ -259,12 +276,11 @@ The cleanest way to verify the project is working is:
 
 1. `GET /health`
 2. `GET /metrics`
-3. `POST /forecast`
-4. `POST /price-actions`
-5. `POST /promo-selection`
-6. `POST /business-pack`
-7. `POST /ab-test/simulate`
-8. optional: `POST /run-agent-pipeline`
+3. `POST /v1/jobs/forecast`
+4. `GET /v1/jobs/{job_id}`
+5. `POST /v1/jobs/price-actions`
+6. `POST /v1/jobs/promo-selection`
+7. `POST /v1/jobs/business-pack`
 
 This order matters because downstream endpoints depend on upstream outputs.
 
@@ -284,12 +300,14 @@ The FastAPI service exposes:
 
 * `GET /health`
 * `GET /metrics`
-* `POST /forecast`
-* `POST /price-actions`
-* `POST /promo-selection`
-* `POST /business-pack`
-* `POST /ab-test/simulate`
-* `POST /run-agent-pipeline` *(optional orchestration layer)*
+* `POST /v1/jobs/forecast`
+* `POST /v1/jobs/price-actions`
+* `POST /v1/jobs/promo-selection`
+* `POST /v1/jobs/business-pack`
+* `GET /v1/jobs/{job_id}`
+
+Legacy synchronous endpoints are under `/internal/*` and are disabled unless `ENABLE_SYNC_ENDPOINTS=true`.
+They are for trusted development use only and keep local `data_dir` compatibility; do not expose them publicly.
 
 This matters because the project is packaged as a service, not just a notebook.
 
@@ -302,26 +320,22 @@ This matters because the project is packaged as a service, not just a notebook.
 Endpoint:
 
 ```text
-POST /forecast
+POST /v1/jobs/forecast
 ```
 
 Recommended first payload:
 
 ```json
 {
-  "data_dir": "data",
-  "max_series": 50,
-  "start_d": "d_1800",
-  "last_train_d": "d_1913",
-  "horizon": 28,
-  "objective": "tweedie",
-  "tweedie_variance_power": 1.1,
-  "two_stage": true,
-  "split_strategy": "last_window",
-  "n_backtests": 1,
-  "backtest_stride": 28,
-  "validate_inputs": true,
-  "save_artifacts": true
+  "dataset_id": "m5_local",
+  "params": {
+    "max_series": 50,
+    "start_d": "d_1800",
+    "last_train_d": "d_1913",
+    "horizon": 28,
+    "split_strategy": "last_window",
+    "n_backtests": 1
+  }
 }
 ```
 
@@ -349,13 +363,13 @@ Main outputs:
 
 * `data/submission.csv`
 * `data/artifacts/forecast/<run_id>/...`
-* forecast metrics and residual quantile artefacts
+* recursive backtest metrics, promotion diagnostics, and prediction interval artefacts
 
 Business meaning:
 
 * compare the model against baselines
 * do **not** assume the model should serve just because it is ML
-* if baseline wins, report that baseline is the safer serving choice
+* if baseline wins, that selected baseline is the serving choice
 
 ---
 
@@ -364,26 +378,20 @@ Business meaning:
 Endpoint:
 
 ```text
-POST /price-actions
+POST /v1/jobs/price-actions
 ```
 
 Payload:
 
 ```json
 {
-  "data_dir": "data",
-  "submission_path": "submission.csv",
-  "last_train_d": "d_1913",
-  "margin": 0.3,
-  "unit_econ_path": null,
-  "max_series": 200,
-  "lookback_days": 365,
-  "elasticity_clip_low": -5.0,
-  "elasticity_clip_high": -0.1,
-  "max_abs_price_change_pct": 0.2,
-  "max_demand_mult": 3.0,
-  "suspicious_profit_gain_pct": 400.0,
-  "suspicious_demand_gain_pct": 500.0
+  "dataset_id": "m5_local",
+  "params": {
+    "submission_path": "submission.csv",
+    "last_train_d": "d_1913",
+    "margin": 0.3,
+    "lookback_days": 365
+  }
 }
 ```
 
@@ -400,9 +408,9 @@ Important path note:
 
 Business meaning:
 
-* this is the **directional action layer**
+* this is the **observational scenario action layer**
 * it estimates where price changes may create profit or demand upside
-* it is **not** proof of production-ready pricing on its own
+* it is **not** proof of causal incremental uplift or production-ready pricing on its own
 * suspicious rows and fallback-evidence rows should be reviewed, not blindly executed
 
 ---
@@ -412,25 +420,20 @@ Business meaning:
 Endpoint:
 
 ```text
-POST /promo-selection
+POST /v1/jobs/promo-selection
 ```
 
 Payload:
 
 ```json
 {
-  "data_dir": "data",
-  "input_path": "price_optimization_results.csv",
-  "max_price_changes_total": 5000,
-  "max_price_changes_per_store": 800,
-  "max_price_changes_per_cat": 1200,
-  "budget": null,
-  "forbid_price_increase": true,
-  "max_abs_price_change_pct": 0.2,
-  "max_demand_mult": 3.0,
-  "objective": "profit",
-  "require_price_change": true,
-  "promo_discount_grid": [-0.2, -0.1, -0.05]
+  "dataset_id": "m5_local",
+  "params": {
+    "input_path": "price_optimization_results.csv",
+    "max_price_changes_total": 5000,
+    "budget": null,
+    "objective": "profit"
+  }
 }
 ```
 
@@ -449,7 +452,7 @@ Business meaning:
 * this converts theoretical opportunities into a constrained execution plan
 * promo selection defaults to discount-only real price changes
 * `0.0` / no-change candidates are only allowed when `require_price_change` is `false`
-* MILP chooses executable promo / price actions under constraints and does not count no-op rows as selected business actions
+* MILP chooses item-action variables under constraints and does not count no-op rows as selected business actions
 * if the constrained plan approves no changes, that is useful information
 * it means the current opportunity set is not yet strong enough for live execution under the current rules
 
@@ -460,14 +463,14 @@ Business meaning:
 Endpoint:
 
 ```text
-POST /business-pack
+POST /v1/jobs/business-pack
 ```
 
 Payload:
 
 ```json
 {
-  "data_dir": "data"
+  "dataset_id": "m5_local"
 }
 ```
 
@@ -493,12 +496,15 @@ Business meaning:
 
 ---
 
-### 5) Simulate A/B-style action outcomes
+### 5) Offline counterfactual simulation and real experiments
 
-Endpoint:
+The old A/B simulation concept is now an internal offline counterfactual simulation, not a public causal claim.
+For genuine randomized price experiments, use the utilities in `m5_pipeline/ab_testing.py` with observed experiment data containing supplied treatment/control assignments.
+
+Internal endpoint, only when synchronous endpoints are explicitly enabled:
 
 ```text
-POST /ab-test/simulate
+POST /internal/offline-counterfactual/simulate
 ```
 
 Payload:
@@ -526,8 +532,8 @@ Important path note:
 
 Business meaning:
 
-* this is a scenario / experimentation support layer
-* it helps frame the recommendations in terms of outcome uncertainty rather than only point estimates
+* this is a non-causal scenario / experimentation support layer
+* it helps frame recommendations in terms of model-implied uncertainty rather than proven incremental lift
 
 ---
 
@@ -536,7 +542,7 @@ Business meaning:
 Endpoint:
 
 ```text
-POST /run-agent-pipeline
+POST /internal/run-agent-pipeline
 ```
 
 Lighter first payload:

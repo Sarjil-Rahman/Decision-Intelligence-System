@@ -17,8 +17,7 @@ def test_metrics():
     assert "http_requests_total" in r.text
 
 
-def test_business_pack_endpoint_returns_controlled_error_without_upstream_outputs(tmp_path):
+def test_public_business_pack_endpoint_removed_by_default(tmp_path):
     c = TestClient(app)
     r = c.post("/business-pack", json={"data_dir": str(tmp_path)})
-    assert r.status_code == 400
-    assert "price_optimization_results.csv not found" in r.json()["error"]
+    assert r.status_code == 404

@@ -31,4 +31,9 @@ jobs:
         env:
           PYTHONPATH: .
         run: |
-          pytest -q tests/test_api_smoke.py
+          python -m compileall api m5_pipeline monitoring analytics_sql agents worker tests
+          pytest -q
+
+      - name: Validate Docker Compose config
+        run: |
+          docker compose config

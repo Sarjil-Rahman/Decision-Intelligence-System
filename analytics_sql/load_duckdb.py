@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import duckdb
 import pandas as pd
@@ -30,7 +30,7 @@ def main():
 
     reports = Path(args.reports_dir)
     dashboard_dir = reports / "dashboard_ready"
-    run_id = args.run_id or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     price_actions_csv = (
         Path(args.price_actions_csv) if args.price_actions_csv else (reports / "price_actions.csv")
@@ -58,7 +58,7 @@ def main():
     con.execute(schema_path.read_text(encoding="utf-8"))
     con.execute(
         "INSERT OR REPLACE INTO runs VALUES (?, ?, ?)",
-        [run_id, datetime.utcnow(), f"Loaded from {reports}"],
+        [run_id, datetime.now(timezone.utc), f"Loaded from {reports}"],
     )
 
     if price_actions_csv.exists():

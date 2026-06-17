@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -179,7 +180,6 @@ def _build_daily_kpis(
     else:
         df = df.merge(prices, on=["store_id", "item_id", "wm_yr_wk"], how="left")
         df["sell_price"] = df.groupby(["store_id", "item_id"])["sell_price"].ffill()
-        df["sell_price"] = df.groupby(["store_id", "item_id"])["sell_price"].bfill()
         df["sell_price"] = df["sell_price"].fillna(0.0)
     df["revenue_gbp"] = df["units_sold"] * df["sell_price"]
     df["gross_margin_proxy_gbp"] = df["revenue_gbp"] * default_margin_rate
@@ -214,7 +214,9 @@ def _build_daily_kpis(
     ]
 
 
-def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_id: str) -> None:
+def _load_business_pack(
+    con: duckdb.DuckDBPyConnection, reports_dir: Path, run_id: str, manifest: dict[str, object]
+) -> None:
     dashboard_dir = reports_dir / "dashboard_ready"
     csv_map = {
         "fact_scenario_comparison.csv": (
@@ -296,10 +298,14 @@ def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_i
             ["kpi_name", "kpi_group", "definition", "interpretation"],
         ),
     }
+    found: list[str] = []
+    missing: list[str] = []
     for filename, (table, columns) in csv_map.items():
         path = dashboard_dir / filename
         if not path.exists():
+            missing.append(str(path))
             continue
+        found.append(str(path))
         df = pd.read_csv(path)
         for col in columns:
             if col not in df.columns:
@@ -313,6 +319,12 @@ def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_i
             upsert_dimension_from_df(con, table, df, ["kpi_name"])
         else:
             _register_insert(con, table, df)
+    manifest["source_artefacts_found"] = found
+    manifest["source_artefacts_missing"] = missing
+    if missing:
+        manifest.setdefault("warnings", []).append(
+            f"Missing optional business-pack artefacts: {len(missing)}"
+        )
 
     price_path = reports_dir.parent / "price_optimization_results.csv"
     if not price_path.exists():
@@ -361,7 +373,7 @@ def build_warehouse(
     default_margin_rate: float = DEFAULT_MARGIN_RATE,
     anomaly_threshold: float = 3.5,
 ) -> dict[str, object]:
-    run_id = run_id or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     data_path = Path(data_dir)
     reports_path = Path(reports_dir)
     db_path = Path(db)
@@ -370,7 +382,7 @@ def build_warehouse(
     con.execute(schema_path.read_text(encoding="utf-8"))
 
     cleanup_run_tables(con, run_id)
-    created_at = datetime.utcnow()
+    created_at = datetime.now(timezone.utc)
     note = f"Local DuckDB warehouse; default gross margin proxy={default_margin_rate:.2%}"
     con.execute("INSERT INTO runs VALUES (?, ?, ?)", [run_id, created_at, note])
     con.execute(
@@ -414,12 +426,40 @@ def build_warehouse(
     if not daily_kpis.empty:
         _register_insert(con, "fact_retail_daily_kpis", daily_kpis)
 
-    _load_business_pack(con, reports_path, run_id)
+    manifest: dict[str, object] = {
+        "run_id": run_id,
+        "build_timestamp_utc": created_at.isoformat(),
+        "idempotency_policy": "same run_id is rebuilt by deleting prior run-scoped rows first",
+        "source_artefacts_found": [],
+        "source_artefacts_missing": [],
+        "warnings": [],
+    }
+    _load_business_pack(con, reports_path, run_id, manifest)
     anomalies = write_kpi_anomalies(con, run_id=run_id, threshold=anomaly_threshold)
+
+    row_counts = {
+        "dim_date": len(calendar),
+        "dim_product_store": len(products),
+        "fact_daily_sales": len(daily_sales),
+        "fact_retail_daily_kpis": len(daily_kpis),
+        "fact_kpi_anomalies": len(anomalies),
+    }
+    views = [
+        row[0]
+        for row in con.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='main' AND table_type='VIEW'"
+        ).fetchall()
+    ]
+    manifest["row_counts"] = row_counts
+    manifest["available_marts_views"] = sorted(views)
+    manifest_path = db_path.with_name(f"{db_path.stem}_{run_id}_manifest.json")
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
     return {
         "db": str(db_path),
         "run_id": run_id,
+        "manifest_path": str(manifest_path),
+        "manifest": manifest,
         "dim_date_rows": len(calendar),
         "dim_product_store_rows": len(products),
         "fact_daily_sales_rows": len(daily_sales),

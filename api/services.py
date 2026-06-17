@@ -19,6 +19,14 @@ def forecast_point_or_quantiles(
     objective: str = "tweedie",
     tweedie_variance_power: float = 1.1,
     two_stage: bool = True,
+    n_jobs: int = 1,
+    n_estimators: Optional[int] = None,
+    classifier_n_estimators: int = 500,
+    regressor_n_estimators: Optional[int] = None,
+    classifier_early_stopping_rounds: int = 50,
+    regressor_early_stopping_rounds: Optional[int] = None,
+    lightgbm_verbosity: int = -1,
+    random_state: int = 42,
     split_strategy: str = "rolling_origin",
     n_backtests: int = 3,
     backtest_stride: int = 28,
@@ -37,6 +45,14 @@ def forecast_point_or_quantiles(
         objective=objective,  # type: ignore[arg-type]
         tweedie_variance_power=tweedie_variance_power,
         two_stage=two_stage,
+        n_jobs=n_jobs,
+        n_estimators=n_estimators or ForecastConfig.n_estimators,
+        classifier_n_estimators=classifier_n_estimators,
+        regressor_n_estimators=regressor_n_estimators,
+        classifier_early_stopping_rounds=classifier_early_stopping_rounds,
+        regressor_early_stopping_rounds=regressor_early_stopping_rounds,
+        lightgbm_verbosity=lightgbm_verbosity,
+        random_state=random_state,
         split_strategy=split_strategy,  # type: ignore[arg-type]
         n_backtests=n_backtests,
         backtest_stride=backtest_stride,
@@ -56,6 +72,9 @@ def forecast_point_or_quantiles(
     return {
         "submission_path": fres["submission_path"],
         "winner": fres["winner"],
+        "selected_baseline": fres.get("selected_baseline"),
+        "promotion": fres.get("promotion", {}),
+        "prediction_intervals": fres.get("prediction_intervals", {}),
         "backtests": fres["backtests"],
         "residual_quantiles": ci,
         "artifacts": fres.get("artifacts", {}),
@@ -141,11 +160,11 @@ def simulate_ab_test(
     seed: int = 42,
 ) -> dict:
     """
-    Offline A/B test simulator wrapper.
+    Deprecated internal offline counterfactual simulator wrapper.
 
     Reads the optimizer output CSV and generates an uplift distribution + bootstrap CI.
     """
-    from m5_pipeline.ab_testing import ABTestSimConfig, simulate_price_ab_test
+    from m5_pipeline.ab_testing import ABTestSimConfig, simulate_offline_counterfactual
 
     cfg = ABTestSimConfig(
         price_actions_csv=price_actions_csv,
@@ -156,7 +175,7 @@ def simulate_ab_test(
         n_boot=n_boot,
         seed=seed,
     )
-    return simulate_price_ab_test(cfg)
+    return simulate_offline_counterfactual(cfg)
 
 
 def generate_business_reporting_pack(data_dir: str) -> Dict[str, Any]:

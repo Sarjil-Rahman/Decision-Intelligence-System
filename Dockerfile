@@ -10,10 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
-
 COPY . /app
+RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
 EXPOSE 8000
 

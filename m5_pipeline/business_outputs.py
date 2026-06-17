@@ -19,7 +19,7 @@ class BusinessPackConfig:
     reports_subdir: str = "reports"
     dashboard_subdir: str = "dashboard_ready"
     docs_subdir: str = "docs"
-    dashboard_mockup_path: str = "dashboards/power_bi_tableau/retail_decision_dashboard_mockup.png"
+    dashboard_mockup_path: str = "reports/dashboard_ready/retail_decision_dashboard_mockup.png"
 
 
 REASON_CODE_REFERENCE: List[Dict[str, Any]] = [
@@ -125,13 +125,63 @@ def _latest_forecast_backtests(data_dir: str) -> List[Dict[str, Any]]:
         return json.load(fh)
 
 
+def _latest_forecast_metadata(data_dir: str) -> Dict[str, Any]:
+    latest = _latest_forecast_artifacts_dir(data_dir)
+    if latest is None:
+        return {}
+    return {
+        "promotion": _read_json_if_exists(latest / "promotion.json") or {},
+        "prediction_intervals": _read_json_if_exists(latest / "prediction_intervals_summary.json")
+        or {},
+        "run_dir": str(latest),
+    }
+
+
 def _float(v: Any) -> float:
     if v is None:
         return float("nan")
     try:
         return float(v)
-    except Exception:
+    except (TypeError, ValueError):
         return float("nan")
+
+
+def _best_baseline_wmape(latest: Dict[str, Any]) -> float:
+    vals = [
+        _float(latest.get("wmape_baseline_mean_28")),
+        _float(latest.get("wmape_baseline_seas_7", latest.get("wmape_baseline_seasonal_7"))),
+        _float(latest.get("wmape_baseline_seas_364", latest.get("wmape_baseline_seasonal_364"))),
+    ]
+    finite = [v for v in vals if np.isfinite(v)]
+    return min(finite) if finite else float("nan")
+
+
+def _forecast_summary_values(
+    backtests: Optional[List[Dict[str, Any]]], forecast_metadata: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    latest = backtests[0] if backtests else {}
+    best_baseline_wmape = _best_baseline_wmape(latest) if latest else float("nan")
+    latest_model_wmape = _float(latest.get("wmape_lgbm"))
+    promotion = (forecast_metadata or {}).get("promotion", {}) or {}
+    aggregate = promotion.get("aggregate_metrics", {}) if isinstance(promotion, dict) else {}
+    winner = promotion.get("winner") if isinstance(promotion, dict) else None
+    selected_baseline = promotion.get("selected_baseline") if isinstance(promotion, dict) else None
+    if not winner:
+        winner = "baseline" if latest and latest_model_wmape > best_baseline_wmape else "lgbm"
+    return {
+        "forecast_winner": str(winner),
+        "selected_baseline": selected_baseline,
+        "latest_model_wmape": latest_model_wmape,
+        "latest_best_baseline_wmape": best_baseline_wmape,
+        "aggregate_model_wmape": _float(aggregate.get("aggregate_lgbm_wmape")),
+        "aggregate_selected_baseline_wmape": _float(
+            aggregate.get("aggregate_selected_baseline_wmape")
+        ),
+        "aggregate_improvement_pct": _float(aggregate.get("aggregate_improvement_pct")),
+        "promotion_status": promotion.get("promotion_status"),
+        "promotion_reasons": promotion.get("promotion_reasons", []),
+        "interval_status": (forecast_metadata or {}).get("prediction_intervals", {}).get("status"),
+    }
 
 
 def build_reason_coded_actions(
@@ -174,16 +224,22 @@ def build_reason_coded_actions(
     else:
         df["applied_is_change"] = 0
 
-    df["final_price_recommendation"] = np.where(
-        df["selected"] == 1,
-        df.get("applied_price", df.get("best_price")),
-        df.get("best_price", df.get("price")),
-    )
-    df["final_profit_projection"] = np.where(
-        df["selected"] == 1,
-        df.get("applied_profit", df.get("best_profit")),
-        df.get("best_profit", df.get("base_profit")),
-    )
+    if "applied_price" in df.columns:
+        df["final_price_recommendation"] = df["applied_price"].fillna(df["price"])
+    else:
+        df["final_price_recommendation"] = np.where(
+            df["selected"] == 1,
+            df.get("best_price", df.get("price")),
+            df.get("best_price", df.get("price")),
+        )
+    if "applied_profit" in df.columns:
+        df["final_profit_projection"] = df["applied_profit"].fillna(df["base_profit"])
+    else:
+        df["final_profit_projection"] = np.where(
+            df["selected"] == 1,
+            df.get("best_profit", df.get("base_profit")),
+            df.get("best_profit", df.get("base_profit")),
+        )
 
     def classify(row: pd.Series) -> tuple[str, str, str, str, str]:
         price = _float(row.get("price"))
@@ -360,6 +416,8 @@ def build_scenario_comparison(
     price_df: pd.DataFrame,
     promo_df: Optional[pd.DataFrame],
     backtests: Optional[List[Dict[str, Any]]] = None,
+    forecast_metadata: Optional[Dict[str, Any]] = None,
+    candidate_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     base_profit = float(price_df["base_profit"].sum())
     opt_profit = float(price_df["best_profit"].sum())
@@ -378,14 +436,15 @@ def build_scenario_comparison(
         selected_rows = 0
         spend_used = 0.0
 
-    latest = backtests[0] if backtests else {}
-    best_baseline_wmape = np.nan
-    if latest:
-        best_baseline_wmape = min(
-            _float(latest.get("wmape_baseline_mean_28")),
-            _float(latest.get("wmape_baseline_seas_7")),
-            _float(latest.get("wmape_baseline_seas_364")),
-        )
+    forecast_values = _forecast_summary_values(backtests, forecast_metadata)
+    forecast_winner = forecast_values["forecast_winner"]
+    latest_model_wmape = forecast_values["latest_model_wmape"]
+    best_baseline_wmape = forecast_values["latest_best_baseline_wmape"]
+    candidate_actions = (
+        int(len(candidate_df))
+        if candidate_df is not None
+        else int((promo_df.get("eligible", 0) == 1).sum()) if promo_df is not None else 0
+    )
 
     rows = [
         {
@@ -400,12 +459,8 @@ def build_scenario_comparison(
             "avg_price_change_pct": 0.0,
             "avg_profit_uplift_pct": 0.0,
             "budget_used_gbp": 0.0,
-            "forecast_winner": (
-                "baseline"
-                if latest and _float(latest.get("wmape_lgbm")) > best_baseline_wmape
-                else "lgbm"
-            ),
-            "latest_model_wmape": _float(latest.get("wmape_lgbm")),
+            "forecast_winner": forecast_winner,
+            "latest_model_wmape": latest_model_wmape,
             "latest_best_baseline_wmape": best_baseline_wmape,
         },
         {
@@ -446,12 +501,8 @@ def build_scenario_comparison(
                 ).mean()
             ),
             "budget_used_gbp": 0.0,
-            "forecast_winner": (
-                "baseline"
-                if latest and _float(latest.get("wmape_lgbm")) > best_baseline_wmape
-                else "lgbm"
-            ),
-            "latest_model_wmape": _float(latest.get("wmape_lgbm")),
+            "forecast_winner": forecast_winner,
+            "latest_model_wmape": latest_model_wmape,
             "latest_best_baseline_wmape": best_baseline_wmape,
         },
         {
@@ -468,9 +519,7 @@ def build_scenario_comparison(
                 if np.isfinite(constrained_profit)
                 else float("nan")
             ),
-            "candidate_actions": (
-                int((promo_df.get("eligible", 0) == 1).sum()) if promo_df is not None else 0
-            ),
+            "candidate_actions": candidate_actions,
             "selected_actions": selected_rows,
             "selected_price_changes": selected_changes,
             "avg_price_change_pct": (
@@ -506,12 +555,8 @@ def build_scenario_comparison(
                 else float("nan")
             ),
             "budget_used_gbp": spend_used,
-            "forecast_winner": (
-                "baseline"
-                if latest and _float(latest.get("wmape_lgbm")) > best_baseline_wmape
-                else "lgbm"
-            ),
-            "latest_model_wmape": _float(latest.get("wmape_lgbm")),
+            "forecast_winner": forecast_winner,
+            "latest_model_wmape": latest_model_wmape,
             "latest_best_baseline_wmape": best_baseline_wmape,
         },
     ]
@@ -525,22 +570,19 @@ def build_executive_kpi_summary(
     promo_df: Optional[pd.DataFrame],
     backtests: Optional[List[Dict[str, Any]]],
     uplift_backtest: Optional[Dict[str, Any]],
+    forecast_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    latest = backtests[0] if backtests else {}
-    best_baseline_wmape = np.nan
-    if latest:
-        best_baseline_wmape = min(
-            _float(latest.get("wmape_baseline_mean_28")),
-            _float(latest.get("wmape_baseline_seas_7")),
-            _float(latest.get("wmape_baseline_seas_364")),
+    forecast_values = _forecast_summary_values(backtests, forecast_metadata)
+    best_baseline_wmape = forecast_values["latest_best_baseline_wmape"]
+    model_wmape = forecast_values["latest_model_wmape"]
+    forecast_winner = forecast_values["forecast_winner"]
+    model_uplift = forecast_values["aggregate_improvement_pct"]
+    if not np.isfinite(model_uplift):
+        model_uplift = (
+            ((best_baseline_wmape - model_wmape) / (best_baseline_wmape + 1e-9) * 100.0)
+            if backtests
+            else float("nan")
         )
-    model_wmape = _float(latest.get("wmape_lgbm"))
-    forecast_winner = "baseline" if latest and model_wmape > best_baseline_wmape else "lgbm"
-    model_uplift = (
-        ((best_baseline_wmape - model_wmape) / (best_baseline_wmape + 1e-9) * 100.0)
-        if latest
-        else float("nan")
-    )
 
     global_fallback_share = (
         float(
@@ -603,8 +645,16 @@ def build_executive_kpi_summary(
         "readiness": readiness,
         "headline": {
             "forecast_winner": forecast_winner,
+            "selected_baseline": forecast_values["selected_baseline"],
+            "promotion_status": forecast_values["promotion_status"],
+            "promotion_reasons": forecast_values["promotion_reasons"],
+            "interval_status": forecast_values["interval_status"],
             "latest_model_wmape": model_wmape,
             "latest_best_baseline_wmape": best_baseline_wmape,
+            "aggregate_model_wmape": forecast_values["aggregate_model_wmape"],
+            "aggregate_selected_baseline_wmape": forecast_values[
+                "aggregate_selected_baseline_wmape"
+            ],
             "forecast_wmape_uplift_pct": model_uplift,
             "baseline_profit_gbp": _float(
                 scenario_df.loc[
@@ -856,6 +906,9 @@ def _write_dashboard_mockup(
     path: str | Path, executive: Dict[str, Any], scenario_df: pd.DataFrame, reason_mix: pd.DataFrame
 ) -> Optional[str]:
     try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
 
         p = Path(path)
@@ -928,12 +981,18 @@ def generate_business_pack(cfg: BusinessPackConfig) -> Dict[str, Any]:
             "price_optimization_results.csv not found. Run price optimisation before generating the business pack."
         )
     promo_df = _read_csv_if_exists(Path(cfg.data_dir) / "promo_selection_results.csv")
+    candidate_df = _read_csv_if_exists(Path(cfg.data_dir) / "promo_action_candidates.csv")
     backtests = _latest_forecast_backtests(cfg.data_dir)
+    forecast_metadata = _latest_forecast_metadata(cfg.data_dir)
     uplift_backtest = _read_json_if_exists(reports_dir / "uplift_backtest.json")
 
     reason_df = build_reason_coded_actions(price_df=price_df, promo_df=promo_df)
     scenario_df = build_scenario_comparison(
-        price_df=price_df, promo_df=promo_df, backtests=backtests
+        price_df=price_df,
+        promo_df=promo_df,
+        backtests=backtests,
+        forecast_metadata=forecast_metadata,
+        candidate_df=candidate_df,
     )
     executive = build_executive_kpi_summary(
         price_df=price_df,
@@ -942,6 +1001,7 @@ def generate_business_pack(cfg: BusinessPackConfig) -> Dict[str, Any]:
         promo_df=promo_df,
         backtests=backtests,
         uplift_backtest=uplift_backtest,
+        forecast_metadata=forecast_metadata,
     )
     by_store, by_cat, reason_mix = _build_store_category_rollups(reason_df)
     reason_ref = pd.DataFrame(REASON_CODE_REFERENCE)
@@ -979,9 +1039,10 @@ def generate_business_pack(cfg: BusinessPackConfig) -> Dict[str, Any]:
             dashboard_files["fact_uplift_backtest_csv"] = dashboard_dir / "fact_uplift_backtest.csv"
 
     markdown_paths = _write_markdown_files(cfg, executive)
-    mockup_path = _write_dashboard_mockup(
-        cfg.dashboard_mockup_path, executive, scenario_df, reason_mix
-    )
+    mockup_target = Path(cfg.dashboard_mockup_path)
+    if not mockup_target.is_absolute():
+        mockup_target = Path(cfg.data_dir) / mockup_target
+    mockup_path = _write_dashboard_mockup(mockup_target, executive, scenario_df, reason_mix)
     if mockup_path:
         dashboard_files["dashboard_mockup_png"] = Path(mockup_path)
 

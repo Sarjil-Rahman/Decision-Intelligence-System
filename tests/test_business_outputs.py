@@ -56,6 +56,7 @@ def test_scenario_comparison_has_three_scenarios():
     )
     promo_df = pd.DataFrame(
         {
+            "id": ["x1", "x2"],
             "price": [10.0, 20.0],
             "applied_price": [10.0, 19.0],
             "base_profit": [100.0, 200.0],
@@ -66,9 +67,60 @@ def test_scenario_comparison_has_three_scenarios():
             "promo_spend_proxy": [0.0, 5.0],
         }
     )
-    out = build_scenario_comparison(price_df, promo_df, backtests=[])
+    candidate_df = pd.DataFrame({"id": ["x1", "x1", "x2", "x2", "x2"]})
+    out = build_scenario_comparison(price_df, promo_df, backtests=[], candidate_df=candidate_df)
     assert set(out["scenario"]) == {
         "baseline_current_price",
         "unconstrained_price_optimizer",
         "constrained_execution_plan",
     }
+    constrained = out.loc[out["scenario"].eq("constrained_execution_plan")].iloc[0]
+    assert constrained["profit_gbp"] == 305.0
+    assert constrained["candidate_actions"] == 5
+    assert constrained["selected_actions"] == 1
+
+
+def test_scenario_comparison_uses_aggregate_promotion_winner():
+    price_df = pd.DataFrame(
+        {
+            "id": ["x1"],
+            "price": [10.0],
+            "best_price": [11.0],
+            "base_profit": [100.0],
+            "best_profit": [110.0],
+            "best_delta": [0.1],
+        }
+    )
+    promo_df = pd.DataFrame(
+        {
+            "id": ["x1"],
+            "price": [10.0],
+            "applied_price": [10.0],
+            "base_profit": [100.0],
+            "applied_profit": [100.0],
+            "selected": [0],
+            "eligible": [1],
+            "applied_is_change": [0],
+            "promo_spend_proxy": [0.0],
+        }
+    )
+    backtests = [
+        {
+            "wmape_lgbm": 0.10,
+            "wmape_baseline_mean_28": 0.20,
+            "wmape_baseline_seas_7": 0.25,
+            "wmape_baseline_seas_364": 0.30,
+        }
+    ]
+    metadata = {
+        "promotion": {
+            "winner": "baseline",
+            "selected_baseline": "mean_28",
+            "aggregate_metrics": {"aggregate_improvement_pct": -1.0},
+        }
+    }
+
+    out = build_scenario_comparison(
+        price_df, promo_df, backtests=backtests, forecast_metadata=metadata
+    )
+    assert set(out["forecast_winner"]) == {"baseline"}

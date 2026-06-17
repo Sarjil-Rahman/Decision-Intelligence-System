@@ -15,6 +15,7 @@ class PromoSelectionConfig:
     data_dir: str
     input_path: str = "price_optimization_results.csv"
     out_path: str = "promo_selection_results.csv"
+    candidate_out_path: str = "promo_action_candidates.csv"
 
     # Constraints for realism
     max_price_changes_total: Optional[int] = 5000
@@ -32,6 +33,8 @@ class PromoSelectionConfig:
     objective: Literal["profit", "demand"] = "profit"  # what to optimise under constraints
     require_price_change: bool = True  # if True, never select a no-op
     promo_discount_grid: Tuple[float, ...] = (-0.20, -0.10, -0.05)  # candidate % deltas
+    solver_time_limit_seconds: int = 60
+    allow_greedy_fallback: bool = False
 
     # Reporting
     write_reports: bool = True
@@ -104,8 +107,16 @@ def _build_promo_summary(out: pd.DataFrame) -> Dict[str, Any]:
 
     return {
         "base_profit_gbp": base_profit_gbp,
+        "base_revenue_gbp": (
+            float(df["base_revenue"].sum()) if "base_revenue" in df.columns else float("nan")
+        ),
+        "base_demand_28d": float(df["base_demand_28d"].sum()),
         "optimised_profit_gbp": optimised_profit_gbp,
         "constrained_profit_gbp": constrained_profit_gbp,
+        "constrained_revenue_gbp": (
+            float(df["applied_revenue"].sum()) if "applied_revenue" in df.columns else float("nan")
+        ),
+        "constrained_demand_28d": float(df["applied_demand"].sum()),
         "delta_base_to_constrained_gbp": delta_base_to_constrained_gbp,
         "uplift_constrained_pct": uplift_constrained_pct,
         "uplift_distribution_gbp": uplift_dist_gbp,
@@ -179,8 +190,10 @@ def _validate_input_price_opt(df: pd.DataFrame) -> None:
 
 
 def _build_candidates(df: pd.DataFrame, cfg: PromoSelectionConfig) -> pd.DataFrame:
-    """Pick the best candidate action per row, given objective + guardrails."""
+    """Build one row per item-action candidate; do not pre-collapse to a local best."""
     _validate_input_price_opt(df)
+    if "base_revenue" not in df.columns:
+        df["base_revenue"] = df["price"] * df["base_demand_28d"]
 
     base_p = df["price"].to_numpy(dtype=np.float64)
     base_q = df["base_demand_28d"].to_numpy(dtype=np.float64)
@@ -188,22 +201,15 @@ def _build_candidates(df: pd.DataFrame, cfg: PromoSelectionConfig) -> pd.DataFra
     e = df["elasticity"].to_numpy(dtype=np.float64)
     base_profit = df["base_profit"].to_numpy(dtype=np.float64)
 
-    # Candidate generation
     cap = float(cfg.max_abs_price_change_pct)
     lo = base_p * (1.0 - cap)
     hi = base_p * (1.0 + cap)
 
-    # Start with "best_price" as a candidate too (keeps parity with unconstrained optimiser)
     deltas = list(cfg.promo_discount_grid)
     if not cfg.require_price_change and 0.0 not in deltas:
         deltas.append(0.0)
     deltas = sorted(set(float(x) for x in deltas))
-
-    best_score = np.full(len(df), -np.inf, dtype=np.float64)
-    best_p = base_p.copy()
-    best_q = base_q.copy()
-    best_profit_arr = base_profit.copy()
-    best_delta = np.zeros(len(df), dtype=np.float64)
+    candidate_frames = []
 
     for delta in deltas:
         cand_p = base_p * (1.0 + float(delta))
@@ -225,47 +231,54 @@ def _build_candidates(df: pd.DataFrame, cfg: PromoSelectionConfig) -> pd.DataFra
 
         if cfg.objective == "demand":
             score = demand_gain
-            ok = demand_gain > 0
+            eligible = demand_gain > 0
         else:
             score = profit_gain
-            ok = profit_gain > 0
+            eligible = profit_gain > 0
 
         if cfg.require_price_change:
-            ok = ok & (np.abs(cand_p - base_p) > 1e-9)
+            eligible = eligible & (np.abs(cand_p - base_p) > 1e-9)
+        if cfg.forbid_price_increase:
+            eligible = eligible & (cand_p <= base_p + 1e-9)
 
-        better = ok & (score > best_score)
-        if np.any(better):
-            best_score[better] = score[better]
-            best_p[better] = cand_p[better]
-            best_q[better] = cand_q[better]
-            best_profit_arr[better] = cand_profit[better]
-            best_delta[better] = float(delta)
+        cand = df[
+            [
+                "id",
+                "item_id",
+                "store_id",
+                "cat_id",
+                "price",
+                "cost",
+                "base_demand_28d",
+                "base_revenue",
+                "base_profit",
+            ]
+        ].copy()
+        cand["action_id"] = cand["id"].astype(str) + f"::delta_{delta:.6f}"
+        cand["new_price"] = cand_p
+        cand["new_demand"] = cand_q
+        cand["new_revenue"] = cand_p * cand_q
+        cand["new_profit"] = cand_profit
+        cand["revenue_gain"] = cand["new_revenue"] - cand["base_revenue"]
+        cand["profit_gain"] = profit_gain
+        cand["demand_gain"] = demand_gain
+        cand["score"] = np.where(np.isfinite(score), score, 0.0)
+        cand["chosen_delta"] = float(delta)
+        cand["promo_spend_proxy"] = np.where(
+            cand["new_price"] < cand["price"],
+            (cand["price"] - cand["new_price"]) * cand["new_demand"],
+            0.0,
+        )
+        cand["is_change"] = (np.abs(cand["new_price"] - cand["price"]) > 1e-9).astype(int)
+        cand["eligible"] = eligible.astype(int)
+        cand["guardrail_reason"] = np.where(cand["eligible"] == 1, "", "non_positive_or_guardrail")
+        candidate_frames.append(cand)
 
-    # Build candidate table
-    cand = df[
-        ["id", "item_id", "store_id", "cat_id", "price", "cost", "base_demand_28d", "base_profit"]
-    ].copy()
-    cand["new_price"] = best_p
-    cand["new_demand"] = best_q
-    cand["new_profit"] = best_profit_arr
-    cand["profit_gain"] = cand["new_profit"] - cand["base_profit"]
-    cand["demand_gain"] = cand["new_demand"] - cand["base_demand_28d"]
-    cand["score"] = best_score
-    cand["chosen_delta"] = best_delta
-    cand["promo_spend_proxy"] = np.where(
-        cand["new_price"] < cand["price"],
-        (cand["price"] - cand["new_price"]) * cand["new_demand"],
-        0.0,
-    )
-    cand["is_change"] = (np.abs(cand["new_price"] - cand["price"]) > 1e-9).astype(int)
-
-    # Eligible actions are those with positive score and (optionally) non-noop
-    cand["eligible"] = (cand["score"] > 0).astype(int)
-    if cfg.require_price_change:
-        cand["eligible"] = (cand["eligible"] & (cand["is_change"] == 1)).astype(int)
-    cand.loc[~np.isfinite(cand["score"]), "score"] = 0.0
-
-    return cand
+    if not candidate_frames:
+        return pd.DataFrame()
+    out = pd.concat(candidate_frames, ignore_index=True)
+    out = out.sort_values(["id", "chosen_delta"]).reset_index(drop=True)
+    return out
 
 
 def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
@@ -275,7 +288,7 @@ def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
     df = pd.read_csv(os.path.join(cfg.data_dir, cfg.input_path))
     cand = _build_candidates(df, cfg)
 
-    # If no constraints are set, apply everything eligible
+    # If no constraints are set, select the best eligible action per item.
     if (
         cfg.max_price_changes_total is None
         and cfg.max_price_changes_per_store is None
@@ -283,8 +296,11 @@ def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
         and cfg.budget is None
     ):
         out = cand.copy()
-        out["selected"] = out["eligible"]
-        return _write(out, cfg, method="no_constraints")
+        out["selected"] = 0
+        pool = out[out["eligible"] == 1].sort_values(["id", "score"], ascending=[True, False])
+        best_idx = pool.groupby("id", sort=False).head(1).index
+        out.loc[best_idx, "selected"] = 1
+        return _write(out, cfg, method="no_constraints", solver_status="not_required")
 
     # Try MILP (best) — fallback to greedy if PuLP isn't installed.
     try:
@@ -303,6 +319,9 @@ def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
         for i in range(len(cand)):
             if int(cand.loc[i, "eligible"]) == 0:
                 prob += x[i] == 0
+
+        for _, idxs in cand.groupby("id", sort=False).groups.items():
+            prob += pulp.lpSum([x[i] for i in idxs]) <= 1
 
         if cfg.max_price_changes_total is not None:
             prob += pulp.lpSum([cand.loc[i, "is_change"] * x[i] for i in range(len(cand))]) <= int(
@@ -326,15 +345,30 @@ def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
                     cfg.max_price_changes_per_cat
                 )
 
-        prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=int(cfg.solver_time_limit_seconds))
+        prob.solve(solver)
+        solver_status = str(pulp.LpStatus.get(prob.status, prob.status))
+        if solver_status not in {"Optimal", "Feasible"}:
+            raise RuntimeError(f"MILP solve failed with status={solver_status}")
 
         out = cand.copy()
         out["selected"] = [
             1 if float(pulp.value(x[i]) or 0.0) > 0.5 else 0 for i in range(len(cand))
         ]
-        return _write(out, cfg, method=method)
+        return _write(
+            out,
+            cfg,
+            method=method,
+            solver_status=solver_status,
+            objective_value=float(pulp.value(prob.objective) or 0.0),
+        )
 
-    except Exception:
+    except ImportError as exc:
+        if not cfg.allow_greedy_fallback:
+            raise ImportError(
+                "PuLP is required for MILP promo selection; enable allow_greedy_fallback for a labelled fallback."
+            ) from exc
+        fallback_reason = "pulp_import_error"
         logger.info("PuLP not available → using greedy fallback.")
         method = "greedy_fallback"
 
@@ -348,8 +382,12 @@ def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
         total_changes = 0
         store_counts: Dict[str, int] = {}
         cat_counts: Dict[str, int] = {}
+        selected_items: set[str] = set()
 
         for idx, r in pool.iterrows():
+            item_key = str(r["id"])
+            if item_key in selected_items:
+                continue
             store = str(r["store_id"])
             cat = str(r["cat_id"])
 
@@ -371,13 +409,20 @@ def run_promo_selection(cfg: PromoSelectionConfig) -> Dict[str, object]:
                 continue
 
             out.loc[idx, "selected"] = 1
+            selected_items.add(item_key)
             if int(r["is_change"]) == 1:
                 total_changes += 1
                 store_counts[store] = store_counts.get(store, 0) + 1
                 cat_counts[cat] = cat_counts.get(cat, 0) + 1
             spend_used += float(r["promo_spend_proxy"])
 
-        return _write(out, cfg, method=method)
+        return _write(
+            out,
+            cfg,
+            method=method,
+            solver_status="not_run",
+            fallback_reason=fallback_reason,
+        )
 
 
 def _constraint_report(out: pd.DataFrame, cfg: PromoSelectionConfig) -> Dict[str, Any]:
@@ -437,7 +482,57 @@ def _constraint_report(out: pd.DataFrame, cfg: PromoSelectionConfig) -> Dict[str
     return rep
 
 
-def _write(out: pd.DataFrame, cfg: PromoSelectionConfig, method: str) -> Dict[str, object]:
+def _build_item_decisions(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Collapse item-action candidates to exactly one final decision row per item."""
+    if candidates.empty:
+        return candidates.copy()
+
+    selected = candidates.loc[candidates["selected"] == 1].copy()
+    selected_ids = set(selected["id"].astype(str))
+    no_action_rows = []
+    for item_id, group in candidates.groupby("id", sort=False):
+        if str(item_id) in selected_ids:
+            continue
+        row = group.iloc[0].copy()
+        row["action_id"] = f"{item_id}::no_action"
+        row["new_price"] = row["price"]
+        row["new_demand"] = row["base_demand_28d"]
+        row["new_revenue"] = row.get("base_revenue", row["price"] * row["base_demand_28d"])
+        row["new_profit"] = row["base_profit"]
+        row["revenue_gain"] = 0.0
+        row["profit_gain"] = 0.0
+        row["demand_gain"] = 0.0
+        row["score"] = 0.0
+        row["chosen_delta"] = 0.0
+        row["promo_spend_proxy"] = 0.0
+        row["is_change"] = 0
+        row["selected"] = 0
+        row["eligible"] = int(group["eligible"].astype(int).max())
+        row["guardrail_reason"] = "no_selected_action"
+        no_action_rows.append(row)
+
+    pieces = [selected]
+    if no_action_rows:
+        pieces.append(pd.DataFrame(no_action_rows))
+    decisions = pd.concat(pieces, ignore_index=True)
+    decisions = decisions.sort_values("id").reset_index(drop=True)
+    if decisions["id"].duplicated().any():
+        duplicated = decisions.loc[decisions["id"].duplicated(), "id"].astype(str).tolist()
+        raise RuntimeError(
+            "Expected one promotion decision per item; duplicates: " + ", ".join(duplicated)
+        )
+    return decisions
+
+
+def _write(
+    out: pd.DataFrame,
+    cfg: PromoSelectionConfig,
+    method: str,
+    *,
+    solver_status: str,
+    objective_value: Optional[float] = None,
+    fallback_reason: Optional[str] = None,
+) -> Dict[str, object]:
     if cfg.require_price_change:
         out.loc[out["is_change"] == 0, "selected"] = 0
 
@@ -445,17 +540,48 @@ def _write(out: pd.DataFrame, cfg: PromoSelectionConfig, method: str) -> Dict[st
     out["applied_demand"] = np.where(
         out["selected"] == 1, out["new_demand"], out["base_demand_28d"]
     )
+    if "new_revenue" not in out.columns:
+        out["new_revenue"] = out["new_price"] * out["new_demand"]
+    if "base_revenue" not in out.columns:
+        out["base_revenue"] = out["price"] * out["base_demand_28d"]
+    out["applied_revenue"] = np.where(out["selected"] == 1, out["new_revenue"], out["base_revenue"])
     out["applied_profit"] = np.where(out["selected"] == 1, out["new_profit"], out["base_profit"])
     out["applied_is_change"] = (np.abs(out["applied_price"] - out["price"]) > 1e-9).astype(int)
 
     rep = _constraint_report(out, cfg)
+    rep["solver_status"] = solver_status
+    rep["fallback_reason"] = fallback_reason
+    rep["objective_value"] = objective_value
+    rep["candidate_count"] = int(len(out))
+    rep["selected_item_count"] = int(out.loc[out["selected"] == 1, "id"].nunique())
+    rep["selected_action_count"] = int(out["selected"].sum())
     out["constraint_violation"] = int(rep["any_violation"])
+    decisions = _build_item_decisions(out)
+    decisions["applied_price"] = np.where(
+        decisions["selected"] == 1, decisions["new_price"], decisions["price"]
+    )
+    decisions["applied_demand"] = np.where(
+        decisions["selected"] == 1, decisions["new_demand"], decisions["base_demand_28d"]
+    )
+    decisions["applied_revenue"] = np.where(
+        decisions["selected"] == 1, decisions["new_revenue"], decisions["base_revenue"]
+    )
+    decisions["applied_profit"] = np.where(
+        decisions["selected"] == 1, decisions["new_profit"], decisions["base_profit"]
+    )
+    decisions["applied_is_change"] = (
+        np.abs(decisions["applied_price"] - decisions["price"]) > 1e-9
+    ).astype(int)
+    decisions["constraint_violation"] = int(rep["any_violation"])
 
     # Stakeholder summary (constrained results)
-    summary = _build_promo_summary(out)
+    summary = _build_promo_summary(decisions)
 
+    candidate_path = os.path.join(cfg.data_dir, cfg.candidate_out_path)
+    out.to_csv(candidate_path, index=False)
+    get_logger("promo_select").info("Wrote: %s", candidate_path)
     out_path = os.path.join(cfg.data_dir, cfg.out_path)
-    out.to_csv(out_path, index=False)
+    decisions.to_csv(out_path, index=False)
     get_logger("promo_select").info("Wrote: %s", out_path)
 
     reports = {}
@@ -469,7 +595,7 @@ def _write(out: pd.DataFrame, cfg: PromoSelectionConfig, method: str) -> Dict[st
         reports["promo_selection_summary"] = sum_path
 
         try:
-            df_store = out.groupby("store_id", as_index=False)[
+            df_store = decisions.groupby("store_id", as_index=False)[
                 ["base_profit", "applied_profit"]
             ].sum()
             df_store["uplift_gbp"] = df_store["applied_profit"] - df_store["base_profit"]
@@ -477,20 +603,26 @@ def _write(out: pd.DataFrame, cfg: PromoSelectionConfig, method: str) -> Dict[st
             df_store.to_csv(store_csv, index=False)
             reports["constrained_uplift_by_store_csv"] = store_csv
 
-            df_cat = out.groupby("cat_id", as_index=False)[["base_profit", "applied_profit"]].sum()
+            df_cat = decisions.groupby("cat_id", as_index=False)[
+                ["base_profit", "applied_profit"]
+            ].sum()
             df_cat["uplift_gbp"] = df_cat["applied_profit"] - df_cat["base_profit"]
             cat_csv = os.path.join(rep_dir, "constrained_uplift_by_category.csv")
             df_cat.to_csv(cat_csv, index=False)
             reports["constrained_uplift_by_category_csv"] = cat_csv
-        except Exception:
+        except (OSError, ValueError, KeyError):
             pass
 
         reports["promo_selection_report"] = rep_path
 
     return {
         "promo_path": out_path,
+        "candidate_path": candidate_path,
         "method": method,
-        "n": int(len(out)),
+        "solver_status": solver_status,
+        "fallback_reason": fallback_reason,
+        "n": int(len(decisions)),
+        "candidate_n": int(len(out)),
         "constraint_report": rep,
         "summary": summary,
         "reports": reports,

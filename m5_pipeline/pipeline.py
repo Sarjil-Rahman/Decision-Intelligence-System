@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--n-backtests", type=int, default=3)
     p.add_argument("--backtest-stride", type=int, default=28)
+    p.add_argument("--n-jobs", type=int, default=1)
+    p.add_argument("--n-estimators", type=int, default=None)
+    p.add_argument("--classifier-n-estimators", type=int, default=500)
+    p.add_argument("--regressor-n-estimators", type=int, default=None)
+    p.add_argument("--classifier-early-stopping-rounds", type=int, default=50)
+    p.add_argument("--regressor-early-stopping-rounds", type=int, default=None)
+    p.add_argument("--lightgbm-verbosity", type=int, default=-1)
+    p.add_argument("--random-state", type=int, default=42)
 
     # Pricing
     p.add_argument("--skip-price-opt", action="store_true")
@@ -120,6 +128,14 @@ def main() -> None:
         out_submission="submission.csv",
         objective=args.objective,
         tweedie_variance_power=args.tweedie_power,
+        n_jobs=args.n_jobs,
+        n_estimators=args.n_estimators or ForecastConfig.n_estimators,
+        classifier_n_estimators=args.classifier_n_estimators,
+        regressor_n_estimators=args.regressor_n_estimators,
+        classifier_early_stopping_rounds=args.classifier_early_stopping_rounds,
+        regressor_early_stopping_rounds=args.regressor_early_stopping_rounds,
+        lightgbm_verbosity=args.lightgbm_verbosity,
+        random_state=args.random_state,
         split_strategy=args.split_strategy,
         n_backtests=args.n_backtests,
         backtest_stride=args.backtest_stride,
@@ -262,6 +278,9 @@ def main() -> None:
         "validation": vrep,
         "forecast": {
             "winner": fres["winner"],
+            "selected_baseline": fres.get("selected_baseline"),
+            "promotion": fres.get("promotion", {}),
+            "prediction_intervals": fres.get("prediction_intervals", {}),
             "latest_split": latest.get("split", {}),
             "residual_q10": latest.get("residual_q10", float("nan")),
             "residual_q50": latest.get("residual_q50", float("nan")),

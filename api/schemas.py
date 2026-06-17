@@ -15,6 +15,14 @@ class ForecastRequest(BaseModel):
     objective: Literal["tweedie", "poisson"] = "tweedie"
     tweedie_variance_power: float = Field(default=1.1, ge=1.0, le=1.9)
     two_stage: bool = True
+    n_jobs: int = Field(default=1, ge=1, le=8)
+    n_estimators: Optional[int] = Field(default=None, ge=10, le=4000)
+    classifier_n_estimators: int = Field(default=500, ge=10, le=2000)
+    regressor_n_estimators: Optional[int] = Field(default=None, ge=10, le=4000)
+    classifier_early_stopping_rounds: int = Field(default=50, ge=0, le=500)
+    regressor_early_stopping_rounds: Optional[int] = Field(default=None, ge=0, le=500)
+    lightgbm_verbosity: int = Field(default=-1, ge=-1, le=2)
+    random_state: int = Field(default=42, ge=0)
 
     # Production evaluation config
     split_strategy: Literal["rolling_origin", "last_window"] = "rolling_origin"
@@ -31,12 +39,15 @@ class ForecastResponse(BaseModel):
     winner: str
     backtests: List[Dict[str, Any]]
 
-    # Convenience: latest residual quantiles for confidence intervals
+    # Deprecated compatibility fields; use prediction_intervals from artifacts/responses.
     residual_q10: float
     residual_q50: float
     residual_q90: float
 
     artifacts: Dict[str, Any]
+    selected_baseline: Optional[str] = None
+    promotion: Dict[str, Any] = Field(default_factory=dict)
+    prediction_intervals: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PriceActionsRequest(BaseModel):

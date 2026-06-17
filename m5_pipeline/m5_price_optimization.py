@@ -371,6 +371,9 @@ def _build_price_opt_summary(
         elasticity_source_mix = src.to_dict(orient="records")
 
     return {
+        "evidence_type": "observational_scenario_model",
+        "causal_validated": False,
+        "requires_randomized_validation": True,
         "base_profit_gbp": base_profit_gbp,
         "optimised_profit_gbp": optimised_profit_gbp,
         "uplift_gbp": uplift_gbp,
@@ -578,7 +581,7 @@ def run_price_optimization(cfg: PriceOptConfig) -> Dict[str, object]:
             end_d=cfg.elasticity_end_d,
             segment="non_event",
         )
-    except Exception:
+    except (ValueError, KeyError, TypeError):
         # Never fail the optimiser because of a diagnostic split
         el_event, el_nonevent = None, None
 
@@ -779,7 +782,7 @@ def run_price_optimization(cfg: PriceOptConfig) -> Dict[str, object]:
             }
             write_json(os.path.join(rep_dir, "kpis.json"), kpis)
             reports["kpis_json"] = os.path.join(rep_dir, "kpis.json")
-        except Exception:
+        except (OSError, ValueError, KeyError):
             pass
 
     # Always compute summary for API/pipeline consumption (even if you don't write reports)
@@ -796,7 +799,8 @@ def run_price_optimization(cfg: PriceOptConfig) -> Dict[str, object]:
         "limitations": [
             "No cross-item cannibalisation modeled.",
             "No explicit stock / inventory constraints modeled.",
-            "Uplift is model-implied from elasticities + costs/margins (validate with real margins when available).",
+            "Uplift is observational and scenario-implied from elasticities + costs/margins; it is not causal incremental lift.",
+            "Validate price actions with randomized experiments before claiming causal impact.",
         ],
     }
 
@@ -815,7 +819,7 @@ def backtest_price_uplift(
     max_demand_mult: float = 3.0,
     price_grid: Tuple[float, ...] = (-0.20, -0.10, 0.0, 0.10, 0.20),
 ) -> Dict[str, Any]:
-    """Approximate uplift backtest on multiple historical cutoffs.
+    """Approximate observational scenario backtest on multiple historical cutoffs.
 
     Method (approx):
       - For each cutoff d_k:
@@ -823,9 +827,10 @@ def backtest_price_uplift(
           base_q = sum of *actual* sales over next horizon days (if available)
           elasticity = estimated using history up to d_k
           run same isoelastic optimiser to compute best_profit vs base_profit
-      - Aggregate uplift per store_id and cat_id so business can see where it comes from.
+      - Aggregate model-implied uplift per store_id and cat_id so business can see where it comes from.
 
-    This gives a credibility layer even when costs are proxy / elasticity is noisy.
+    This is not causal validation. It gives a directional credibility layer when
+    costs are proxy / elasticity is noisy.
     """
     logger = get_logger("price_uplift_backtest")
 

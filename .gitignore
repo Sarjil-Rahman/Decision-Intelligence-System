@@ -8,46 +8,33 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
-# OS / IDE
+# OS/IDE
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# Environment files
+# Env
 .env
 .env.*
 !.env.example
 
-# Local-only files
-prompt.md
-codexset
-.codex/
-
-# Local outputs / generated reports
+# Local outputs / data
 /artifacts/
 /reports/
 
-# Data: ignore actual data, keep DVC metadata
+# Ignore data contents, but allow DVC metadata files
 /data/**
-!/data/
-!/data/**/
 !/data/*.dvc
 !/data/**/*.dvc
 
-# Raw/generated file types
+# Ignore raw/generated file types unless tracked by DVC
 *.csv
 *.parquet
 *.feather
 *.joblib
 *.pkl
 !*.dvc
-
-# Local databases
-*.duckdb
-*.db
-*.sqlite
-analytics_sql/*.duckdb
 
 # Coverage
 .coverage
@@ -57,8 +44,17 @@ coverage.xml
 # Notebook checkpoints
 .ipynb_checkpoints/
 
-# DVC local/private files
-.dvc/config
-.dvc/config.local
-.dvc/cache/
+# DVC local files
 .dvc/tmp/
+.dvc/config.local
+
+# Local databases
+*.duckdb
+analytics_sql/*.duckdb
+*_manifest.json
+
+# Local Codex/task control files
+prompt.md
+codexset
+FIXES_APPLIED.md
+BUSINESS_PACK_CHANGES.md

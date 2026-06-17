@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -38,6 +39,8 @@ def cleanup_run_tables(con: duckdb.DuckDBPyConnection, run_id: str) -> None:
         "fact_sell_price",
         "fact_retail_daily_kpis",
         "fact_price_actions",
+        "fact_promo_action_candidates",
+        "fact_promo_item_decisions",
         "agg_uplift_by_store",
         "agg_uplift_by_category",
         "fact_kpis",
@@ -179,7 +182,6 @@ def _build_daily_kpis(
     else:
         df = df.merge(prices, on=["store_id", "item_id", "wm_yr_wk"], how="left")
         df["sell_price"] = df.groupby(["store_id", "item_id"])["sell_price"].ffill()
-        df["sell_price"] = df.groupby(["store_id", "item_id"])["sell_price"].bfill()
         df["sell_price"] = df["sell_price"].fillna(0.0)
     df["revenue_gbp"] = df["units_sold"] * df["sell_price"]
     df["gross_margin_proxy_gbp"] = df["revenue_gbp"] * default_margin_rate
@@ -214,7 +216,9 @@ def _build_daily_kpis(
     ]
 
 
-def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_id: str) -> None:
+def _load_business_pack(
+    con: duckdb.DuckDBPyConnection, reports_dir: Path, run_id: str, manifest: dict[str, object]
+) -> None:
     dashboard_dir = reports_dir / "dashboard_ready"
     csv_map = {
         "fact_scenario_comparison.csv": (
@@ -296,10 +300,14 @@ def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_i
             ["kpi_name", "kpi_group", "definition", "interpretation"],
         ),
     }
+    found: list[str] = []
+    missing: list[str] = []
     for filename, (table, columns) in csv_map.items():
         path = dashboard_dir / filename
         if not path.exists():
+            missing.append(str(path))
             continue
+        found.append(str(path))
         df = pd.read_csv(path)
         for col in columns:
             if col not in df.columns:
@@ -313,6 +321,12 @@ def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_i
             upsert_dimension_from_df(con, table, df, ["kpi_name"])
         else:
             _register_insert(con, table, df)
+    manifest["source_artefacts_found"] = found
+    manifest["source_artefacts_missing"] = missing
+    if missing:
+        manifest.setdefault("warnings", []).append(
+            f"Missing optional business-pack artefacts: {len(missing)}"
+        )
 
     price_path = reports_dir.parent / "price_optimization_results.csv"
     if not price_path.exists():
@@ -347,6 +361,122 @@ def _load_business_pack(con: duckdb.DuckDBPyConnection, reports_dir: Path, run_i
         out = price_df[cols].copy()
         out.insert(0, "run_id", run_id)
         _register_insert(con, "fact_price_actions", out)
+    else:
+        manifest.setdefault("warnings", []).append("Missing optional price action artefact")
+
+    promo_candidate_path = reports_dir.parent / "promo_action_candidates.csv"
+    if promo_candidate_path.exists():
+        candidate_df = pd.read_csv(promo_candidate_path)
+        cols = [
+            "id",
+            "action_id",
+            "store_id",
+            "item_id",
+            "cat_id",
+            "price",
+            "new_price",
+            "base_demand_28d",
+            "new_demand",
+            "base_revenue",
+            "new_revenue",
+            "base_profit",
+            "new_profit",
+            "profit_gain",
+            "demand_gain",
+            "chosen_delta",
+            "promo_spend_proxy",
+            "eligible",
+            "selected",
+            "is_change",
+        ]
+        for col in cols:
+            if col not in candidate_df.columns:
+                candidate_df[col] = None
+        out = candidate_df[cols].copy()
+        out.insert(0, "run_id", run_id)
+        _register_insert(con, "fact_promo_action_candidates", out)
+    else:
+        manifest.setdefault("warnings", []).append(
+            "Missing optional promo action candidate artefact"
+        )
+
+    promo_decision_path = reports_dir.parent / "promo_selection_results.csv"
+    if promo_decision_path.exists():
+        decision_df = pd.read_csv(promo_decision_path)
+        cols = [
+            "id",
+            "action_id",
+            "store_id",
+            "item_id",
+            "cat_id",
+            "price",
+            "applied_price",
+            "base_demand_28d",
+            "applied_demand",
+            "base_revenue",
+            "applied_revenue",
+            "base_profit",
+            "applied_profit",
+            "profit_gain",
+            "demand_gain",
+            "chosen_delta",
+            "promo_spend_proxy",
+            "selected",
+            "eligible",
+            "applied_is_change",
+            "constraint_violation",
+        ]
+        for col in cols:
+            if col not in decision_df.columns:
+                decision_df[col] = None
+        out = decision_df[cols].copy()
+        out.insert(0, "run_id", run_id)
+        _register_insert(con, "fact_promo_item_decisions", out)
+    else:
+        manifest.setdefault("warnings", []).append("Missing optional promo item decision artefact")
+
+
+def _loaded_row_counts(con: duckdb.DuckDBPyConnection, run_id: str) -> dict[str, int]:
+    run_scoped = [
+        "fact_daily_sales",
+        "fact_sell_price",
+        "fact_retail_daily_kpis",
+        "fact_price_actions",
+        "fact_promo_action_candidates",
+        "fact_promo_item_decisions",
+        "agg_uplift_by_store",
+        "agg_uplift_by_category",
+        "fact_kpis",
+        "fact_scenario_comparison",
+        "fact_action_recommendations",
+        "agg_reason_code_mix",
+        "agg_store_action_summary",
+        "agg_category_action_summary",
+        "fact_uplift_backtest",
+        "fact_kpi_anomalies",
+        "runs",
+        "dim_run",
+    ]
+    dimensions = [
+        "dim_date",
+        "dim_item",
+        "dim_store",
+        "dim_product_store",
+        "dim_reason_codes",
+        "dim_kpi_dictionary",
+    ]
+    counts: dict[str, int] = {}
+    for table in run_scoped:
+        count = int(
+            con.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id = ?", [run_id]).fetchone()[0]
+        )
+        if count:
+            counts[table] = count
+    for table in dimensions:
+        count = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if count:
+            counts[table] = count
+    return dict(sorted(counts.items()))
 
 
 def build_warehouse(
@@ -361,7 +491,7 @@ def build_warehouse(
     default_margin_rate: float = DEFAULT_MARGIN_RATE,
     anomaly_threshold: float = 3.5,
 ) -> dict[str, object]:
-    run_id = run_id or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     data_path = Path(data_dir)
     reports_path = Path(reports_dir)
     db_path = Path(db)
@@ -370,7 +500,7 @@ def build_warehouse(
     con.execute(schema_path.read_text(encoding="utf-8"))
 
     cleanup_run_tables(con, run_id)
-    created_at = datetime.utcnow()
+    created_at = datetime.now(timezone.utc)
     note = f"Local DuckDB warehouse; default gross margin proxy={default_margin_rate:.2%}"
     con.execute("INSERT INTO runs VALUES (?, ?, ?)", [run_id, created_at, note])
     con.execute(
@@ -414,12 +544,34 @@ def build_warehouse(
     if not daily_kpis.empty:
         _register_insert(con, "fact_retail_daily_kpis", daily_kpis)
 
-    _load_business_pack(con, reports_path, run_id)
+    manifest: dict[str, object] = {
+        "run_id": run_id,
+        "build_timestamp_utc": created_at.isoformat(),
+        "idempotency_policy": "same run_id is rebuilt by deleting prior run-scoped rows first",
+        "source_artefacts_found": [],
+        "source_artefacts_missing": [],
+        "warnings": [],
+    }
+    _load_business_pack(con, reports_path, run_id, manifest)
     anomalies = write_kpi_anomalies(con, run_id=run_id, threshold=anomaly_threshold)
+
+    row_counts = _loaded_row_counts(con, run_id)
+    views = [
+        row[0]
+        for row in con.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='main' AND table_type='VIEW'"
+        ).fetchall()
+    ]
+    manifest["row_counts"] = row_counts
+    manifest["available_marts_views"] = sorted(views)
+    manifest_path = db_path.with_name(f"{db_path.stem}_{run_id}_manifest.json")
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
     return {
         "db": str(db_path),
         "run_id": run_id,
+        "manifest_path": str(manifest_path),
+        "manifest": manifest,
         "dim_date_rows": len(calendar),
         "dim_product_store_rows": len(products),
         "fact_daily_sales_rows": len(daily_sales),

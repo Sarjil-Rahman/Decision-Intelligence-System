@@ -101,6 +101,24 @@ def _parse_cutoffs(s: Optional[str], last_train_d: str, stride: int, n: int) -> 
     return out
 
 
+def _metric_value(metrics: dict, primary_key: str, legacy_key: Optional[str] = None) -> float:
+    value = metrics.get(primary_key)
+    if value is None and legacy_key is not None:
+        value = metrics.get(legacy_key)
+    if value is None:
+        fallback = f" or legacy metric {legacy_key}" if legacy_key else ""
+        raise KeyError(f"Missing required forecast metric {primary_key}{fallback}")
+    return float(value)
+
+
+def _best_baseline_wmape(latest: dict) -> float:
+    return min(
+        _metric_value(latest, "wmape_baseline_mean_28"),
+        _metric_value(latest, "wmape_baseline_seasonal_7", "wmape_baseline_seas_7"),
+        _metric_value(latest, "wmape_baseline_seasonal_364", "wmape_baseline_seas_364"),
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     logger = get_logger("runner")
@@ -146,11 +164,7 @@ def main() -> None:
 
     # Headline: WMAPE (overall) + segment WMAPE to prove robustness
     latest = fres["backtests"][0]
-    best_baseline_wmape = min(
-        latest["wmape_baseline_mean_28"],
-        latest["wmape_baseline_seas_7"],
-        latest["wmape_baseline_seas_364"],
-    )
+    best_baseline_wmape = _best_baseline_wmape(latest)
     lift_wmape = (best_baseline_wmape - latest["wmape_lgbm"]) / (best_baseline_wmape + 1e-9) * 100.0
 
     if fres["winner"] == "lgbm":

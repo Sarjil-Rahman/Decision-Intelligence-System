@@ -7,6 +7,8 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.git/
+.codex/
 
 # OS/IDE
 .vscode/
@@ -20,13 +22,14 @@ Thumbs.db
 !.env.example
 
 # Local outputs / data
-/artifacts/
-/reports/
+artifacts/
+reports/
 
 # Ignore data contents, but allow DVC metadata files
 /data/**
 !/data/*.dvc
 !/data/**/*.dvc
+data/*_backup.csv
 
 # Ignore raw/generated file types unless tracked by DVC
 *.csv
@@ -51,6 +54,8 @@ coverage.xml
 # Local databases
 *.duckdb
 analytics_sql/*.duckdb
+analytics_sql/*.db
+analytics_sql/*.sqlite
 *_manifest.json
 
 # Local Codex/task control files

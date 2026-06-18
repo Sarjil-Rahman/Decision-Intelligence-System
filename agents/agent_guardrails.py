@@ -31,9 +31,7 @@ def assess_forecast_gate(forecast_res: Dict[str, Any]) -> Tuple[bool, str]:
 
     baseline_metrics = {
         "mean_28": _metric_value(latest, "wmape_baseline_mean_28"),
-        "seasonal_7": _metric_value(
-            latest, "wmape_baseline_seasonal_7", "wmape_baseline_seas_7"
-        ),
+        "seasonal_7": _metric_value(latest, "wmape_baseline_seasonal_7", "wmape_baseline_seas_7"),
         "seasonal_364": _metric_value(
             latest, "wmape_baseline_seasonal_364", "wmape_baseline_seas_364"
         ),

@@ -838,7 +838,7 @@ This pack translates model outputs into decision-support artefacts for a recruit
 - Be honest that the price optimisation layer still relies on simulated economics unless real costs and live experimentation are provided.
 
 ## Truth-in-advertising guidance
-Current readiness: **{executive.get('readiness', 'unknown')}**.
+Current readiness: **{executive.get("readiness", "unknown")}**.
 Do not claim this is a live production pricing engine unless you replace proxies with real commercial data and experiment design.
 """
     user_guide_path.write_text(user_guide, encoding="utf-8")

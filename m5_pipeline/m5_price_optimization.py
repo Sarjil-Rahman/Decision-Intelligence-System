@@ -239,8 +239,8 @@ def _q(series: pd.Series, qs=(0.10, 0.50, 0.90)) -> Dict[str, float]:
     """Safe quantiles for reporting (handles empty/inf/nan)."""
     vals = series.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
     if len(vals) == 0:
-        return {f"p{int(q*100)}": float("nan") for q in qs}
-    return {f"p{int(q*100)}": float(np.quantile(vals.to_numpy(), q)) for q in qs}
+        return {f"p{int(q * 100)}": float("nan") for q in qs}
+    return {f"p{int(q * 100)}": float(np.quantile(vals.to_numpy(), q)) for q in qs}
 
 
 def _build_price_opt_summary(

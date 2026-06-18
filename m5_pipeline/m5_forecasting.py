@@ -1573,7 +1573,9 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
                 q = np.clip(reg_f.predict(X_day[feature_cols]).astype(np.float64), 0, None)
                 yhat = np.clip(p * q, 0, None)
             else:
-                yhat = np.clip(model_for_serving.predict(X_day[feature_cols]).astype(np.float64), 0, None)  # type: ignore[union-attr]
+                yhat = np.clip(
+                    model_for_serving.predict(X_day[feature_cols]).astype(np.float64), 0, None
+                )  # type: ignore[union-attr]
         else:
             yhat = np.asarray(X_day["_baseline"].values, dtype=np.float64)
             yhat = np.clip(yhat, 0, None)
@@ -1645,7 +1647,9 @@ def run_forecast(cfg: ForecastConfig) -> Dict[str, object]:
         )
 
         # Data quality report for the latest validation frame (monitoring baseline)
-        dq = data_quality_report(valid_latest, cols=["actual", served_prediction_col], name="valid_frame")  # type: ignore[arg-type]
+        dq = data_quality_report(
+            valid_latest, cols=["actual", served_prediction_col], name="valid_frame"
+        )  # type: ignore[arg-type]
         write_json(os.path.join(run_dir, "data_quality_valid.json"), dq)
 
         # Save model

@@ -443,9 +443,7 @@ def build_scenario_comparison(
     candidate_actions = (
         int(len(candidate_df))
         if candidate_df is not None
-        else int((promo_df.get("eligible", 0) == 1).sum())
-        if promo_df is not None
-        else 0
+        else int((promo_df.get("eligible", 0) == 1).sum()) if promo_df is not None else 0
     )
 
     rows = [
